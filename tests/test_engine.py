@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from ckapp.engine.jobs import (CANCELLED, DONE, ERROR, INTERRUPTED, JobQueue, JobSpec, ProgressParser,
+from ckapp.engine.jobs import (CANCELLED, DONE, ERROR, HELD, INTERRUPTED, JobQueue, JobSpec, ProgressParser,
                                build_command, discover_outputs)
 
 FAKE = str(Path(__file__).with_name("fake_ck_run.py"))
@@ -241,5 +241,117 @@ def test_api(clip, tmp_path):
         assert c.delete(f"/jobs/{jid}", headers=h).json()["ok"]
         assert c.get("/jobs", headers=h).json() == []
         assert "disk" in c.get("/system", headers=h).json()
+        held = c.post("/jobs", json={"input": clip, "output_dir": str(tmp_path / "o2"), "hold": True}, headers=h)
+        hid = held.json()["id"]
+        assert held.json()["status"] == HELD
+        time.sleep(0.3)
+        assert c.get(f"/jobs/{hid}", headers=h).json()["status"] == HELD          # waits for Start
+        assert c.post("/jobs/start", headers=h).json()["started"] == 1
+        assert wait_for(lambda: c.get(f"/jobs/{hid}", headers=h).json()["status"] == DONE)
+        assert c.post(f"/jobs/{hid}/start", headers=h).status_code == 409
+        assert c.get("/mask", headers=h).status_code == 501                       # no mask service given
     finally:
+        q.shutdown()
+
+
+# ------------------------------------------------------------------------- held jobs
+def test_held_jobs_wait_survive_restart_and_cancel(clip, tmp_path):
+    hist = tmp_path / "jobs.json"
+    q, _ = make_queue(tmp_path, "ok", history=hist)
+    try:
+        a = q.submit(JobSpec(input=clip, output_dir=str(tmp_path / "a")), hold=True)
+        b = q.submit(JobSpec(input=clip, output_dir=str(tmp_path / "b")), hold=True)
+        time.sleep(0.3)
+        assert a.status == b.status == HELD and not q.busy()          # held jobs don't keep the engine awake
+        q2 = JobQueue.__new__(JobQueue)
+        q2.history_path, q2.jobs = hist, []
+        q2._load_history()
+        assert [j.status for j in q2.jobs] == [HELD, HELD]               # still held after a restart
+        assert q.cancel(b.id) and b.status == CANCELLED
+        assert q.start(a.id) == 1
+        assert wait_for(lambda: a.status == DONE)
+        assert q.start() == 0
+    finally:
+        q.shutdown()
+
+
+def test_before_run_hook_runs_before_each_render(clip, tmp_path):
+    calls = []
+    q = JobQueue(ck_python=sys.executable, ck_root=str(tmp_path), cache_dir=str(tmp_path / "cache"),
+                 command_builder=fake_builder("ok"), before_run=lambda: calls.append(1))
+    try:
+        job = q.submit(JobSpec(input=clip, output_dir=str(tmp_path / "out")))
+        assert wait_for(lambda: job.status == DONE) and calls == [1]
+    finally:
+        q.shutdown()
+
+
+# ------------------------------------------------------------------------- click to mask
+FAKE_SAM = str(Path(__file__).with_name("fake_sam_worker.py"))
+
+
+def _frame(tmp_path):
+    import cv2
+    import numpy as np
+    p = str(tmp_path / "frame.png")
+    cv2.imwrite(p, np.full((90, 160, 3), 128, np.uint8))
+    return p
+
+
+def test_mask_service_download_open_predict_and_device(tmp_path):
+    from ckapp.engine.masks import MaskError, MaskService
+    busy = {"on": False}
+    events = []
+    m = MaskService(ck_python=sys.executable, cache_dir=str(tmp_path / "cache"), gpu_busy=lambda: busy["on"],
+                    on_event=lambda k, d: events.append((k, d)), worker_cmd=[sys.executable, FAKE_SAM])
+    try:
+        img = _frame(tmp_path)
+        assert not m.status()["model"]
+        with pytest.raises(MaskError, match="isn't downloaded"):
+            m.open(img)
+        assert m.download()
+        assert wait_for(lambda: not m.downloading) and m.status()["model"] and not m.error
+        r = m.open(img)
+        assert (r["width"], r["height"], r["device"]) == (160, 90, "cuda")
+        out = str(tmp_path / "masks" / "m.png")
+        r = m.predict(img, [[80, 45, 1]], None, out)
+        import cv2
+        mask = cv2.imread(out, cv2.IMREAD_UNCHANGED)
+        assert mask.shape == (90, 160) and mask[45, 80] == 255 and mask[0, 0] == 0 and 0 < r["area"] < 1
+        m.stop()                                         # what a render start does
+        assert not m.status()["running"]
+        busy["on"] = True                                # render running: the CPU takes over
+        assert m.predict(img, [], [10, 10, 50, 50], out)["device"] == "cpu"
+        busy["on"] = False
+        assert m.open(img)["device"] == "cuda"           # GPU free again
+        with pytest.raises(MaskError, match="not found"):
+            m.open(str(tmp_path / "nope.png"))
+        assert any(k == "mask" for k, _ in events)
+    finally:
+        m.stop()
+
+
+def test_mask_api(tmp_path):
+    from fastapi.testclient import TestClient
+    from ckapp.engine.masks import MaskService
+    from ckapp.engine.server import EventBus, create_app
+    bus = EventBus()
+    q = JobQueue(ck_python=sys.executable, ck_root=str(tmp_path), cache_dir=str(tmp_path / "cache"),
+                 on_event=bus.publish, command_builder=fake_builder("ok"))
+    m = MaskService(ck_python=sys.executable, cache_dir=str(tmp_path / "cache"), gpu_busy=q.busy,
+                    worker_cmd=[sys.executable, FAKE_SAM])
+    try:
+        c = TestClient(create_app(q, bus, "tok", m))
+        h = {"X-CK-Token": "tok"}
+        img = _frame(tmp_path)
+        assert c.get("/mask", headers=h).json()["model"] is False
+        assert c.post("/mask/open", json={"image": img}, headers=h).status_code == 409
+        c.post("/mask/download", headers=h)
+        assert wait_for(lambda: c.get("/mask", headers=h).json()["model"])
+        r = c.post("/mask/predict", json={"image": img, "points": [[20, 20, 1]], "out": str(tmp_path / "m.png")},
+                   headers=h)
+        assert r.status_code == 200 and r.json()["width"] == 160
+        assert c.post("/mask/stop", headers=h).json()["ok"] and not c.get("/mask", headers=h).json()["running"]
+    finally:
+        m.stop()
         q.shutdown()

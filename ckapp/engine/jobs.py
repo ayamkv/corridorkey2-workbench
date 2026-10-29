@@ -56,6 +56,7 @@ class JobSpec:
     bitrate: str = ""                    # e.g. "40M"; when set it replaces crf
     preset: str = "medium"
     ffmpeg_threads: int = 2
+    project: str = ""                    # project.json this render belongs to (bookkeeping only)
 
     def validate(self) -> None:
         if not self.input or not os.path.exists(self.input):
@@ -205,9 +206,10 @@ class ProgressParser:
 
 
 # --------------------------------------------------------------------------- jobs
-QUEUED, RUNNING, DONE, ERROR, CANCELLED, INTERRUPTED = (
-    "queued", "running", "done", "error", "cancelled", "interrupted")
+HELD, QUEUED, RUNNING, DONE, ERROR, CANCELLED, INTERRUPTED = (
+    "held", "queued", "running", "done", "error", "cancelled", "interrupted")
 FINISHED = (DONE, ERROR, CANCELLED, INTERRUPTED)
+PENDING = (HELD, QUEUED, RUNNING)
 
 _ids = itertools.count(1)
 
@@ -289,11 +291,13 @@ class JobQueue:
     def __init__(self, *, ck_python: str, ck_root: str, cache_dir: str, ffmpeg: str = "",
                  history_path: Optional[Path] = None,
                  on_event: Optional[Callable[[str, dict], None]] = None,
-                 command_builder: Callable[..., list[str]] = build_command) -> None:
+                 command_builder: Callable[..., list[str]] = build_command,
+                 before_run: Optional[Callable[[], None]] = None) -> None:
         self.ck_python, self.ck_root, self.cache_dir, self.ffmpeg = ck_python, ck_root, cache_dir, ffmpeg
         self.history_path = history_path
         self.on_event = on_event or (lambda kind, data: None)
         self.command_builder = command_builder
+        self.before_run = before_run or (lambda: None)     # e.g. free the GPU from the mask model
         self.jobs: list[Job] = []
         self.current: Optional[Job] = None
         self._proc: Optional[subprocess.Popen] = None
@@ -306,9 +310,12 @@ class JobQueue:
         self._thread.start()
 
     # -- public -----------------------------------------------------------------------------
-    def submit(self, spec: JobSpec) -> Job:
+    def submit(self, spec: JobSpec, hold: bool = False) -> Job:
+        """`hold`: park the job until start() (Add to queue) instead of running it when the GPU is free."""
         spec.validate()
         job = Job(spec)
+        if hold:
+            job.status, job.stage = HELD, "Waiting for Start"
         with self._lock:
             self.jobs.append(job)
         self._emit(job)
@@ -329,7 +336,7 @@ class JobQueue:
             job = self.get(job_id)
             if job is None:
                 return False
-            if job.status == QUEUED:
+            if job.status in (HELD, QUEUED):
                 self._finish(job, CANCELLED)
                 return True
             if job.status == RUNNING and self._proc is not None:
@@ -338,10 +345,23 @@ class JobQueue:
                 return True
             return False
 
+    def start(self, job_id: Optional[str] = None) -> int:
+        """Release one held job, or all of them when job_id is None. Returns how many."""
+        with self._lock:
+            held = [j for j in self.jobs if j.status == HELD and (job_id is None or j.id == job_id)]
+            for j in held:
+                j.status, j.stage = QUEUED, "Queued"
+        for j in held:
+            self._emit(j)
+        if held:
+            self._save_history()
+            self._wake.set()
+        return len(held)
+
     def remove(self, job_id: str) -> bool:
         with self._lock:
             job = self.get(job_id)
-            if job is None or job.status in (QUEUED, RUNNING):
+            if job is None or job.status in PENDING:
                 return False
             self.jobs.remove(job)
         self.on_event("removed", {"id": job_id})
@@ -377,6 +397,10 @@ class JobQueue:
 
     def _run(self, job: Job) -> None:
         parser = ProgressParser()
+        try:
+            self.before_run()
+        except Exception:  # never let a side service block renders
+            pass
         try:
             os.makedirs(job.spec.output_dir, exist_ok=True)
             os.makedirs(os.path.join(self.cache_dir, "staging"), exist_ok=True)
@@ -488,4 +512,5 @@ class JobQueue:
                 continue
             if job.status in (QUEUED, RUNNING):     # the engine stopped while these were pending
                 job.status, job.stage = INTERRUPTED, "Interrupted"
+            # held jobs stay held: they were waiting for Start, not running
             self.jobs.append(job)

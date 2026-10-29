@@ -20,6 +20,7 @@ from fastapi.responses import StreamingResponse
 
 from .. import __version__
 from .jobs import JobQueue, JobSpec
+from .masks import MaskError, MaskService
 
 
 class EventBus:
@@ -72,7 +73,7 @@ def gpu_info() -> Optional[dict]:
         return None
 
 
-def create_app(queue: JobQueue, bus: EventBus, token: str) -> FastAPI:
+def create_app(queue: JobQueue, bus: EventBus, token: str, masks: Optional[MaskService] = None) -> FastAPI:
     app = FastAPI(title="CorridorKey2 Workbench engine", version=__version__)
 
     def auth(request: Request) -> None:
@@ -102,11 +103,22 @@ def create_app(queue: JobQueue, bus: EventBus, token: str) -> FastAPI:
 
     @app.post("/jobs", dependencies=[Depends(auth)], status_code=201)
     def submit(body: dict) -> dict:
+        """The body is a JobSpec; "hold": true parks the job until /jobs/{id}/start (Add to queue)."""
         try:
-            job = queue.submit(JobSpec.from_dict(body))
+            job = queue.submit(JobSpec.from_dict(body), hold=bool(body.get("hold")))
         except (ValueError, TypeError) as e:
             raise HTTPException(status_code=400, detail=str(e))
         return job.to_dict()
+
+    @app.post("/jobs/start", dependencies=[Depends(auth)])
+    def start_all() -> dict:
+        return {"started": queue.start()}
+
+    @app.post("/jobs/{job_id}/start", dependencies=[Depends(auth)])
+    def start(job_id: str) -> dict:
+        if not queue.start(job_id):
+            raise HTTPException(status_code=409, detail="job is not waiting for Start")
+        return {"ok": True}
 
     @app.get("/jobs/{job_id}", dependencies=[Depends(auth)])
     def job(job_id: str, log: bool = False) -> dict:
@@ -125,6 +137,43 @@ def create_app(queue: JobQueue, bus: EventBus, token: str) -> FastAPI:
     def remove(job_id: str) -> dict:
         if not queue.remove(job_id):
             raise HTTPException(status_code=409, detail="only finished jobs can be removed")
+        return {"ok": True}
+
+    # -- click to mask ------------------------------------------------------------------------
+    def _masks() -> MaskService:
+        if masks is None:
+            raise HTTPException(status_code=501, detail="masks are not available in this engine")
+        return masks
+
+    @app.get("/mask", dependencies=[Depends(auth)])
+    def mask_status() -> dict:
+        return _masks().status()
+
+    @app.post("/mask/download", dependencies=[Depends(auth)], status_code=202)
+    def mask_download() -> dict:
+        _masks().download()
+        return _masks().status()
+
+    @app.post("/mask/open", dependencies=[Depends(auth)])
+    def mask_open(body: dict) -> dict:
+        try:
+            return _masks().open(str(body.get("image", "")))
+        except MaskError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+
+    @app.post("/mask/predict", dependencies=[Depends(auth)])
+    def mask_predict(body: dict) -> dict:
+        try:
+            return _masks().predict(str(body.get("image", "")), list(body.get("points") or []),
+                                    body.get("box") or None, str(body.get("out", "")))
+        except MaskError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/mask/stop", dependencies=[Depends(auth)])
+    def mask_stop() -> dict:
+        _masks().stop()
         return {"ok": True}
 
     @app.get("/events", dependencies=[Depends(auth)])

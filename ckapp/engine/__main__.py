@@ -19,6 +19,7 @@ import uvicorn
 
 from ..config import load_settings, state_dir
 from .jobs import JobQueue
+from .masks import MaskService
 from .server import EventBus, create_app
 
 
@@ -52,9 +53,12 @@ def main(argv: list[str] | None = None) -> None:
     token = secrets.token_urlsafe(24)
 
     bus = EventBus()
+    masks = MaskService(ck_python=s.ck_python, cache_dir=s.cache_dir, gpu_busy=lambda: queue.busy(),
+                        on_event=bus.publish)
     queue = JobQueue(ck_python=s.ck_python, ck_root=s.ck_root, cache_dir=s.cache_dir, ffmpeg=s.ffmpeg,
-                     history_path=state_dir() / "jobs.json", on_event=bus.publish)
-    app = create_app(queue, bus, token)
+                     history_path=state_dir() / "jobs.json", on_event=bus.publish,
+                     before_run=masks.stop)            # the render gets the whole GPU
+    app = create_app(queue, bus, token, masks)
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning",
                                            access_log=False))
 
@@ -76,6 +80,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         server.run()
     finally:
+        masks.stop()
         queue.shutdown()
         try:
             if json.loads(discovery_path().read_text(encoding="utf-8")).get("pid") == os.getpid():
