@@ -46,7 +46,25 @@ D:\CODE\CorridorKey2.0\          upstream clone, unmodified (+ .venv, weights\, 
 D:\CODE\corridorkey2-workbench\  this app (+ its own .venv: no torch)
 ```
 
-## Setup
+## Install for the studio (no Python needed)
+
+Build a package, send it (or put it on a share), and people run `Setup.bat`:
+
+```
+powershell -ExecutionPolicy Bypass -File packaging\make_dist.ps1                         # dist\CorridorKey2 Workbench\
+powershell -ExecutionPolicy Bypass -File packaging\make_dist.ps1 -Models <weights> -Zip  # weights inside, plus a .zip
+```
+
+`Setup.bat` (`packaging/setup.ps1`) installs everything into the folder it sits in. It sets up a private Python 3.12
+with [uv](https://github.com/astral-sh/uv), downloads upstream CorridorKey at the tested commit, installs CUDA PyTorch,
+gets ffmpeg if it isn't on PATH, then places the weights. For the weights, people pick **download** (about 5 GB) or
+**a folder they already have**. That folder can be one holding `corridorkey_v2.safetensors`, or a CorridorKey 2.0
+folder with `weights\` and `vfms\`. Files on the same drive are hard-linked, and anything missing is downloaded. A
+`models\` folder shipped in the package is used automatically. Everything is pinned and checksummed where upstream
+allows it. Running setup again skips finished steps and repairs broken ones. See `packaging/INSTALL.txt` (shipped as
+"READ ME FIRST.txt").
+
+## Setup (development)
 
 1. Clone upstream and set up its venv as its README says: CUDA PyTorch, `requirements.txt`,
    `scripts/download_weights.py`.

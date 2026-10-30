@@ -40,6 +40,15 @@ def _default_ck_root() -> str:
     return ""
 
 
+def _default_ffmpeg() -> str:
+    """ffmpeg on PATH, else the copy the installer puts in <install>/tools/ffmpeg."""
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    bundled = APP_ROOT.parent / "tools" / "ffmpeg" / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+    return str(bundled) if bundled.is_file() else "ffmpeg"
+
+
 def venv_python(root: str | Path) -> str:
     """The python inside a repo's venv, or '' if there is none."""
     for name in (".venv", "venv", "env"):
@@ -64,7 +73,7 @@ class Settings:
         s.ck_root = s.ck_root or _default_ck_root()
         s.ck_python = s.ck_python or (venv_python(s.ck_root) if s.ck_root else "")
         s.cache_dir = s.cache_dir or str(APP_ROOT / ".cache")
-        s.ffmpeg = s.ffmpeg or shutil.which("ffmpeg") or "ffmpeg"
+        s.ffmpeg = s.ffmpeg or _default_ffmpeg()
         return s
 
 

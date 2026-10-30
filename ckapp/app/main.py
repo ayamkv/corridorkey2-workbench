@@ -23,7 +23,7 @@ def _excepthook(kind, value, tb) -> None:
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     sys.excepthook = _excepthook
-    from PySide6.QtGui import QSurfaceFormat
+    from PySide6.QtGui import QIcon, QSurfaceFormat
     from PySide6.QtWidgets import QApplication
 
     from .. import APP_ID, APP_NAME
@@ -39,6 +39,7 @@ def main(argv: list[str] | None = None) -> int:
             pass
     app = QApplication(sys.argv[:1])
     app.setApplicationName(APP_NAME)
+    app.setWindowIcon(QIcon(str(T.ASSETS / "app.ico")))
     T.apply(app)
 
     from .main_window import MainWindow

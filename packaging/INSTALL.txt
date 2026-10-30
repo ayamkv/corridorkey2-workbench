@@ -1,0 +1,47 @@
+CorridorKey2 Workbench (studio build)
+====================================
+
+An unofficial desktop app for Corridor Digital's CorridorKey 2.0 green/blue-screen keyer.
+
+
+What you need
+-------------
+- Windows 10 or 11, 64-bit
+- An NVIDIA RTX 30-series card or newer with at least 4 GB of GPU memory, and a recent driver
+- About 15 GB free on the drive you install to (10 GB if the weights are already on that drive)
+- Internet for the first setup (Python, PyTorch and, if you choose, the model weights)
+
+Nothing needs to be installed first: setup brings its own Python and ffmpeg.
+
+
+Install
+-------
+1. Put this folder where you want the app to live, for example D:\CorridorKey2 Workbench.
+   Avoid paths with non-English characters.
+2. Double-click Setup.bat.
+3. Choose how to get the model weights:
+     1  Download them (about 5 GB), or
+     2  Point at a folder you already have: either one with corridorkey_v2.safetensors and
+        foundation_stats.safetensors, or a CorridorKey 2.0 folder with weights\ and vfms\.
+        Files on the same drive are hard-linked (no extra space); otherwise they are copied.
+   If this package has a models folder, it is used automatically.
+4. Wait for "Done" (10 to 30 minutes, mostly downloads), then start it from the
+   Desktop or Start menu shortcut, or from "CorridorKey2 Workbench.bat" in this folder.
+
+Setup can be run again at any time: it skips what is finished and repairs what is broken.
+A log is written to setup.log.
+
+
+Update
+------
+Replace the app folder with the new one and run Setup.bat again.
+
+
+Uninstall
+---------
+Delete this folder and the two shortcuts. Settings live in %APPDATA%\CorridorKey2Workbench.
+
+
+Moving the folder
+-----------------
+Run Setup.bat again after moving it; it rebuilds the Python environments for the new location.
