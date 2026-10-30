@@ -9,14 +9,11 @@ Check items off as they land. Decisions and the reasons for them live in `PLAN.m
 Read this first when picking the work back up.
 
 **State of the code**
-- `main` is at `5649c8a` (0.3.0), and the private repo https://github.com/ayamkv/corridorkey2-workbench is pushed up to that commit.
-- On top of `main` there are **uncommitted** changes that make up 0.3.1, the studio installer:
+- `main` is 0.3.1, pushed to the private repo https://github.com/ayamkv/corridorkey2-workbench. 0.3.1 is the studio installer:
   - `packaging/`: `setup.ps1`, `Setup.bat`, `make_dist.ps1` and `INSTALL.txt`.
   - The app icon `ckapp/app/assets/app.ico`.
   - ffmpeg detection in `tools\ffmpeg`.
-  - The version bump, plus README and ROADMAP updates.
   - `dist/` is in `.gitignore`.
-  - Commit and push them when the user says so.
 - Branch **`phase-3-4`** is local only and not pushed. It holds one WIP commit, `776b81e`, cut from 0.3.0 (before the installer work):
   - Held jobs in `ckapp/engine/jobs.py`: `HELD`, `submit(hold=)`, `start()`, and a `before_run` hook.
   - The SAM 2.1 tiny worker, `ckapp/engine/sam_worker.py`.
@@ -38,7 +35,6 @@ Read this first when picking the work back up.
 
 **Still pending**
 - [ ] Rename the folder `D:\CODE\corridorkey2webui` to `D:\CODE\corridorkey2-workbench`. Close the running app and engine first: they lock the folder.
-- [ ] Commit and push the installer (0.3.1).
 - [ ] Phase 3 and Phase 4 UI work (below).
 
 **Rules for this machine**
