@@ -63,7 +63,7 @@ def qc(name: str, alpha: int = 255) -> QColor:
     return col
 
 
-STATUS_COLORS = {"ready": "TEXT_DIM", "queued": "WARN", "running": "RUN", "done": "OK",
+STATUS_COLORS = {"ready": "TEXT_DIM", "held": "TEXT", "queued": "WARN", "running": "RUN", "done": "OK",
                  "error": "ERROR", "cancelled": "TEXT_DIM", "interrupted": "WARN", "missing": "ERROR"}
 
 

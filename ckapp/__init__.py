@@ -7,4 +7,4 @@ Corridor Digital's own paid app is also called Workbench, so "unofficial" stays 
 """
 APP_NAME = "CorridorKey2 Workbench"
 APP_ID = "CorridorKey2Workbench"     # state folder, Windows app id
-__version__ = "0.3.1"
+__version__ = "0.4.0"

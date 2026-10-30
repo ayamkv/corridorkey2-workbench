@@ -56,7 +56,7 @@ def start_engine(wait_s: float = 20.0) -> dict:
     info = _discovery()
     h = _health(info) if info else None
     if h and (h.get("version") == __version__ or h.get("busy")):
-        return info
+        return dict(info, version=h.get("version", ""))
     if h and h.get("pid"):
         _stop_engine(int(h["pid"]))
     s = load_settings().resolved()
@@ -78,7 +78,7 @@ def start_engine(wait_s: float = 20.0) -> dict:
         time.sleep(0.25)
         info = _discovery()
         if info and _healthy(info, timeout=1.0):
-            return info
+            return dict(info, version=__version__)
     raise RuntimeError(f"the render engine did not start; see {state_dir() / 'engine.log'}")
 
 
@@ -231,8 +231,26 @@ class EngineClient(QObject):
             reply.deleteLater()
         reply.finished.connect(finished)
 
-    def submit(self, spec: dict, done: Callable[[dict], None]) -> None:
-        self._send("POST", "/jobs", spec, done)
+    @property
+    def engine_version(self) -> str:
+        return (self.info or {}).get("version", "")
+
+    def can_hold(self) -> bool:
+        """Engines before 0.4.0 ignore "hold" and would start the job at once."""
+        from .. import __version__
+        return self.engine_version == __version__
+
+    def submit(self, spec: dict, done: Callable[[dict], None], hold: bool = False) -> None:
+        self._send("POST", "/jobs", dict(spec, hold=True) if hold else spec, done)
+
+    def list_jobs(self, done: Callable[[list], None]) -> None:
+        self._send("GET", "/jobs", None, done, quiet=True)
+
+    def start(self, job_id: str) -> None:
+        self._send("POST", f"/jobs/{job_id}/start")
+
+    def start_all(self) -> None:
+        self._send("POST", "/jobs/start")
 
     def cancel(self, job_id: str) -> None:
         self._send("POST", f"/jobs/{job_id}/cancel")

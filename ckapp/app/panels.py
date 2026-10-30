@@ -10,6 +10,7 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPen
 from PySide6.QtWidgets import (QHBoxLayout, QLabel, QListView, QListWidget, QListWidgetItem, QMenu, QProgressBar,
                                QScrollArea, QStyle, QStyledItemDelegate, QToolButton, QVBoxLayout, QWidget)
 
+from ..engine.jobs import PENDING
 from . import icons
 from . import theme as T
 from .media import open_source, thumbnail, to_display_u8
@@ -194,6 +195,12 @@ class MediaBin(QWidget):
         self.thumbs.pop(clip_id, None)
         self._update_empty()
 
+    def clear(self) -> None:
+        self.list.clear()
+        self.info.clear()
+        self.thumbs.clear()
+        self._update_empty()
+
     def select(self, clip_id: str) -> None:
         for i in range(self.list.count()):
             if self.list.item(i).data(CLIP_ID) == clip_id:
@@ -240,10 +247,17 @@ class JobRow(QWidget):
         self.range = QLabel()
         self.range.setFont(T.num_font(8.5))
         self.range.setObjectName("Dim")
+        self.start = QToolButton()
+        self.start.setObjectName("Icon")
+        self.start.setIcon(icons.play())
+        self.start.setIconSize(QSize(14, 14))
+        self.start.setToolTip("Start this render")
+        self.start.clicked.connect(lambda: self.queue.startRequested.emit(self.job_id))
         self.btn = icon_button("x", "", 14)
         self.btn.clicked.connect(self._button)
         top.addWidget(self.name, 1)
         top.addWidget(self.range)
+        top.addWidget(self.start)
         top.addWidget(self.btn)
         v.addLayout(top)
         self.bar = QProgressBar()
@@ -268,6 +282,7 @@ class JobRow(QWidget):
         self.range.setVisible(bool(rng))
         self.bar.setValue(int(job.get("fraction", 0) * 1000))
         self.bar.setVisible(st in ("running", "queued"))
+        self.start.setVisible(st == "held")
         text = job.get("stage", "")
         if st == "running" and job.get("eta") is not None:
             text += f",  about {_fmt_eta(job['eta'])} left"
@@ -278,10 +293,10 @@ class JobRow(QWidget):
         self.stage.setText(text)
         self.stage.set_color(T.STATUS_COLORS.get(st, "TEXT_DIM") if st in ("error", "done", "interrupted")
                              else "TEXT_FAINT")
-        self.btn.setToolTip("Cancel" if st in ("running", "queued") else "Remove from the list")
+        self.btn.setToolTip("Cancel" if st in PENDING else "Remove from the list")
 
     def _button(self) -> None:
-        if self.job["status"] in ("running", "queued"):
+        if self.job["status"] in PENDING:
             self.queue.cancelRequested.emit(self.job_id)
         else:
             self.queue.removeRequested.emit(self.job_id)
@@ -300,6 +315,8 @@ class QueuePanel(QWidget):
     """Rows in a vertical-only scroll area: they always take the panel's width, never scroll sideways."""
     cancelRequested = Signal(str)
     removeRequested = Signal(str)
+    startRequested = Signal(str)
+    startAllRequested = Signal()
     jobActivated = Signal(str)
 
     def __init__(self, parent=None):
@@ -314,7 +331,15 @@ class QueuePanel(QWidget):
         self.clear_btn.setText("Clear finished")
         self.clear_btn.setToolTip("Remove finished, failed and cancelled renders from this list (files stay)")
         self.clear_btn.clicked.connect(self._clear_finished)
-        v.addWidget(panel_header("queue", "Queue", self.clear_btn))
+        self.start_all_btn = QToolButton()
+        self.start_all_btn.setObjectName("Flat")
+        self.start_all_btn.setText("Start all")
+        self.start_all_btn.setIcon(icons.play())
+        self.start_all_btn.setIconSize(QSize(12, 12))
+        self.start_all_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.start_all_btn.setToolTip("Start every render waiting in the queue")
+        self.start_all_btn.clicked.connect(self.startAllRequested)
+        v.addWidget(panel_header("queue", "Queue", self.start_all_btn, self.clear_btn))
         v.addWidget(hline())
         self.scroll = QScrollArea()
         self.scroll.setObjectName("Panel")
@@ -338,6 +363,7 @@ class QueuePanel(QWidget):
         has = bool(self.rows)
         self.scroll.setVisible(has)
         self.empty.setVisible(not has)
+        self.start_all_btn.setVisible(self.held_count() > 0)
 
     def reset(self, jobs: list[dict]) -> None:
         for jid in list(self.rows):
@@ -368,8 +394,11 @@ class QueuePanel(QWidget):
 
     def _clear_finished(self) -> None:
         for jid, row in list(self.rows.items()):
-            if row.job["status"] not in ("running", "queued"):
+            if row.job["status"] not in PENDING:
                 self.removeRequested.emit(jid)
 
     def active_count(self) -> int:
         return sum(1 for r in self.rows.values() if r.job["status"] in ("running", "queued"))
+
+    def held_count(self) -> int:
+        return sum(1 for r in self.rows.values() if r.job["status"] == "held")

@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDoubleSpinBox, QFileDia
                                QLabel, QPushButton, QRadioButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget)
 
 from . import theme as T
-from .model import PIX_NAMES, VIDEO_DEFAULTS, Clip, describe_export
+from .model import PIX_NAMES, VIDEO_DEFAULTS, Clip, describe_export, fit_estimate
 from . import icons
 from .widgets import ElidedLabel, Section, SliderRow, VramMeter, combo, hline, label, panel_header
 
@@ -23,6 +23,7 @@ class Inspector(QWidget):
     changed = Signal()                      # any setting edited
     rangeEdited = Signal()                  # range edited here (timeline must follow)
     renderRequested = Signal()
+    queueRequested = Signal()
     setInRequested = Signal()
     setOutRequested = Signal()
 
@@ -34,6 +35,7 @@ class Inspector(QWidget):
         self._loading = False
         self.small_gpu = False
         self._disk = ""
+        self._gpu_total_mb = 0
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -109,6 +111,11 @@ class Inspector(QWidget):
         s = Section("GPU memory")
         self.vram = VramMeter(compact=False)
         s.full(self.vram)
+        self.lb_fits = label("", "Faint")
+        self.lb_fits.setWordWrap(True)
+        self.lb_fits.setToolTip("From the table in CorridorKey's README (Long Clips And Low VRAM): what Auto picks "
+                                "for this clip's size on this GPU. Window/stride in frames.")
+        s.full(self.lb_fits)
         self.cb_mem = combo([
             ("Auto", "auto", "CorridorKey picks a window size from free GPU memory, per clip."),
             ("Low VRAM", "low", "Stages work through the cache folder on disk: slower, but fits small GPUs."),
@@ -293,7 +300,8 @@ class Inspector(QWidget):
         head.addWidget(label("Output folder", "Dim"))
         head.addStretch(1)
         self.bt_outdir = QPushButton("Choose…")
-        self.bt_outdir.setToolTip("Where renders go. Default: next to the clip. Right-click to reset.")
+        self.bt_outdir.setToolTip("Where renders go. Default: the project's renders folder. "
+                                  "Right-click to go back to it.")
         self.bt_outdir.clicked.connect(self._choose_outdir)
         self.bt_outdir.setContextMenuPolicy(Qt.CustomContextMenu)
         self.bt_outdir.customContextMenuRequested.connect(self._reset_outdir)
@@ -319,9 +327,18 @@ class Inspector(QWidget):
         self.bt_render.setIcon(icons.svg("render", "ACCENT_FG", 16))
         self.bt_render.setIconSize(QSize(16, 16))
         self.bt_render.setMinimumHeight(34)
-        self.bt_render.setToolTip("Queue this clip with these settings (Ctrl+R)")
+        self.bt_render.setToolTip("Render this clip with these settings now, or as soon as the GPU is free (Ctrl+R)")
         self.bt_render.clicked.connect(self.renderRequested)
-        v.addWidget(self.bt_render)
+        self.bt_queue = QPushButton("Add to queue")
+        self.bt_queue.setMinimumHeight(34)
+        self.bt_queue.setToolTip("Add this clip to the queue without starting it. Press Start in the queue when "
+                                 "you're ready (Ctrl+Shift+R).")
+        self.bt_queue.clicked.connect(self.queueRequested)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(self.bt_queue, 2)
+        row.addWidget(self.bt_render, 3)
+        v.addLayout(row)
         outer.addWidget(box)
 
     # ------------------------------------------------------------------------- binding
@@ -382,6 +399,10 @@ class Inspector(QWidget):
 
     def set_gpu(self, gpu: Optional[dict]) -> None:
         self.vram.set_info(gpu)
+        total = gpu["total_mb"] if gpu else 0
+        if total != self._gpu_total_mb:
+            self._gpu_total_mb = total
+            self._refresh()
 
     def set_disk(self, text: str) -> None:
         if text != self._disk:
@@ -462,6 +483,10 @@ class Inspector(QWidget):
             tip = "Staged through the cache folder on disk: slower, but exact."
         self.lb_mem_tip.setText(tip)
         self.lb_mem_tip.setVisible(bool(tip))
+        fits, warn = fit_estimate(c.width, c.height, self._gpu_total_mb) if self._gpu_total_mb else ("", False)
+        self.lb_fits.setText(fits)
+        self.lb_fits.setStyleSheet(f"color: {T.c('WARN')};" if warn else "")
+        self.lb_fits.setVisible(bool(fits))
         has_hint = s.hint_mode != "none"
         for w in (self.lb_hint_row, self.lb_hint.parentWidget(), self.lb_hint_q, self.sl_hint_q):
             w.setVisible(has_hint)
@@ -521,6 +546,7 @@ class Inspector(QWidget):
             self.lb_summary.setText("    ".join(facts))
             self.lb_summary.setStyleSheet("")
         self.bt_render.setEnabled(not problems)
+        self.bt_queue.setEnabled(not problems)
 
     # ------------------------------------------------------------------------- pickers
     def _choose_hint(self) -> None:

@@ -1,6 +1,8 @@
 """App logic that needs no GPU or window: clip -> job spec, ranges, sessions, media, timeline maths."""
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
 import subprocess
 import sys
@@ -12,7 +14,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from ckapp.app.media import (ExrOutputSource, frame_paths, open_source, probe, to_display_u8,  # noqa: E402
                              to_frame)
-from ckapp.app.model import Clip, ClipSettings, Render, Session  # noqa: E402
+from ckapp.app.model import FIT_TABLE, Clip, ClipSettings, Render, fit_estimate  # noqa: E402
+from ckapp.app.project import (Project, ProjectError, Recent, default_location, safe_name,  # noqa: E402
+                               session_clips)
 from ckapp.app.timeline import tick_steps  # noqa: E402
 
 UPSTREAM = os.environ.get("CK_ROOT", r"D:\CODE\CorridorKey2.0")
@@ -71,29 +75,150 @@ def test_render_dirs_increment(tmp_path):
     assert c.next_render_dir()[0].endswith("render_004")
 
 
-def test_session_round_trip(tmp_path):
+def test_project_round_trip(tmp_path):
     clip_file = tmp_path / "x.mp4"
     clip_file.write_bytes(b"")
-    s = Session(tmp_path / "session.json")
+    p = Project.create(tmp_path / "proj")
     c = Clip(str(clip_file), "video", 50, 25.0, 1280, 720)
     c.settings.range_mode, c.settings.frame_in, c.settings.frame_out, c.settings.despill = "custom", 3, 30, 0.36
-    c.renders.append(Render("job1", str(tmp_path / "r1"), 3, 30, "exr", status="done",
-                            outputs={"alpha": "a"}, label="Render 1"))
-    s.clips.append(c)
-    s.save()
-    s2 = Session(tmp_path / "session.json")
-    s2.load()
-    c2 = s2.clips[0]
-    assert c2.id == c.id and c2.settings == c.settings and c2.frame_range() == (3, 30)
-    assert c2.latest_render().outputs == {"alpha": "a"} and not c2.error
+    p.add(c)
+    out_dir, _ = c.next_render_dir()
+    assert out_dir == os.path.join(p.root, "renders", "x", "render_001")
+    c.renders.append(Render("job1", out_dir, 3, 30, "exr", status="done",
+                            outputs={"alpha": os.path.join(out_dir, "x_alpha_exr")}, label="Render 1"))
+    assert p.save()
+    p2 = Project.open(tmp_path / "proj")
+    c2 = p2.clips[0]
+    assert c2.id == c.id and c2.settings == c.settings and c2.frame_range() == (3, 30) and c2.folder == "x"
+    assert c2.latest_render().outputs == c.latest_render().outputs and not c2.error
     clip_file.unlink()
-    s3 = Session(tmp_path / "session.json")
-    s3.load()
-    assert s3.clips[0].error == "missing"
+    assert Project.open(tmp_path / "proj" / "project.json").clips[0].error == "missing"
+
+
+def test_project_paths_are_relative_so_it_can_move(tmp_path):
+    p = Project.create(tmp_path / "a")
+    c = Clip(str(tmp_path / "plate.mp4"), "video", 10, 24, 64, 64)
+    p.add(c)
+    inside = os.path.join(p.root, "renders", "plate", "render_001")
+    outside = str(tmp_path / "elsewhere" / "plate_ck2" / "render_001")     # from before projects
+    c.renders += [Render("j1", inside, 0, 9, "video", outputs={"fg": os.path.join(inside, "plate_fg.mp4")}),
+                  Render("j0", outside, 0, 9, "video", outputs={"fg": os.path.join(outside, "plate_fg.mp4")})]
+    p.save()
+    raw = json.loads((tmp_path / "a" / "project.json").read_text(encoding="utf-8"))
+    r1, r0 = raw["clips"][0]["renders"]
+    assert r1["out_dir"] == "renders/plate/render_001" and r1["outputs"]["fg"] == "renders/plate/render_001/plate_fg.mp4"
+    assert r0["out_dir"] == outside and "base" not in raw["clips"][0]
+    os.rename(tmp_path / "a", tmp_path / "b")
+    moved = Project.open(tmp_path / "b")
+    m1, m0 = moved.clips[0].renders
+    assert m1.out_dir == os.path.join(str(tmp_path / "b"), "renders", "plate", "render_001")
+    assert m1.outputs["fg"] == os.path.join(m1.out_dir, "plate_fg.mp4") and m0.out_dir == outside
+    assert moved.clips[0].render_root() == os.path.join(str(tmp_path / "b"), "renders", "plate")
+
+
+def test_clip_folders_are_unique(tmp_path):
+    p = Project.create(tmp_path / "p")
+    a = Clip(str(tmp_path / "one" / "plate.mp4"), "video", 10, 24, 64, 64)
+    b = Clip(str(tmp_path / "two" / "Plate.mp4"), "video", 10, 24, 64, 64)
+    seq = Clip(str(tmp_path / "x" / "frames"), "sequence", 10, 24, 64, 64)
+    seq2 = Clip(str(tmp_path / "y" / "frames"), "sequence", 10, 24, 64, 64)
+    for c in (a, b, seq, seq2):
+        p.add(c)
+    assert [c.folder for c in (a, b, seq, seq2)] == ["plate", "Plate_2", "frames", "frames_2"]
+    p.clips.remove(a)                                        # a removed clip's folder on disk stays its own
+    os.makedirs(os.path.join(p.root, "renders", "plate", "render_001"))
+    again = Clip(a.path, "video", 10, 24, 64, 64)
+    p.add(again)
+    assert again.folder == "plate_3"
+
+
+@pytest.mark.parametrize("raw,expect", [("CON", "_CON"), ("nul.txt", "_nul.txt"), ("a:b*c?", "a_b_c_"),
+                                        ("shot. ", "shot"), ("...", "clip")])
+def test_safe_name(raw, expect):
+    assert safe_name(raw) == expect
+
+
+def test_newer_project_refused_and_existing_not_overwritten(tmp_path):
+    p = Project.create(tmp_path / "p")
+    with pytest.raises(ProjectError):
+        Project.create(tmp_path / "p")
+    data = json.loads(p.path.read_text(encoding="utf-8"))
+    data["version"] = 99
+    p.path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ProjectError, match="newer version"):
+        Project.open(p.path)
+
+
+def test_bring_in_old_session(tmp_path):
+    clip_file = tmp_path / "shot.mp4"
+    clip_file.write_bytes(b"")
+    old = Clip(str(clip_file), "video", 20, 24, 64, 64)
+    old.renders.append(Render("j9", str(tmp_path / "shot_ck2" / "render_001"), 0, 19, "video", status="done"))
+    session = tmp_path / "state" / "session.json"
+    session.parent.mkdir()
+    session.write_text(json.dumps({"version": 1, "clips": [dataclasses.asdict(old)]}), encoding="utf-8")
+    assert len(session_clips(session)) == 1
+    p = Project.create(tmp_path / "proj")
+    assert p.bring_in(session) == 1
+    assert not session.exists() and (session.parent / "session.migrated.json").exists()
+    c = Project.open(p.path).clips[0]
+    assert c.renders[0].out_dir == str(tmp_path / "shot_ck2" / "render_001")      # renders stay where they are
+    assert c.next_render_dir()[0] == os.path.join(p.root, "renders", "shot", "render_001")
+
+
+def test_recent_list(tmp_path):
+    r = Recent(tmp_path / "recent.json")
+    for i in range(3):
+        f = tmp_path / f"p{i}" / "project.json"
+        f.parent.mkdir()
+        f.write_text("{}")
+        r.add(str(f))
+    r.add(str(tmp_path / "p0" / "project.json"))
+    r.last_parent = str(tmp_path)
+    r.save()
+    r2 = Recent(tmp_path / "recent.json")
+    assert [os.path.basename(os.path.dirname(p)) for p in r2.projects] == ["p0", "p2", "p1"]
+    os.remove(tmp_path / "p2" / "project.json")
+    assert len(r2.existing()) == 2 and r2.last_parent == str(tmp_path)
+
+
+def test_default_location_never_a_full_system_drive(tmp_path):
+    docs = r"C:\Users\me\Documents"
+    drives = [("C:\\", 3.0), ("D:\\", 400.0), ("E:\\", 120.0)]
+    assert default_location(str(tmp_path), docs, 3.0, drives) == str(tmp_path)          # last folder used wins
+    assert default_location("", docs, 3.0, drives) == os.path.join("D:\\", "CorridorKey2 Projects")
+    assert default_location("", docs, 25.0, drives) == os.path.join(docs, "CorridorKey2 Projects")
+    assert default_location(r"Z:\gone", docs, 3.0, drives).startswith("D:")
 
 
 def test_settings_ignore_unknown_keys():
     assert ClipSettings.from_dict({"despill": 0.2, "from_the_future": 1}).despill == 0.2
+
+
+# ------------------------------------------------------------------------- GPU memory guide
+@pytest.mark.skipif(not os.path.isfile(os.path.join(UPSTREAM, "README.md")), reason="upstream repo not found")
+def test_fit_table_matches_upstream_readme():
+    import re
+    text = open(os.path.join(UPSTREAM, "README.md"), encoding="utf-8").read()
+    rows = {}
+    for m in re.finditer(r"^\|\s*(\d+) GB\s*\|(.+)\|\s*$", text, re.M):
+        rows[int(m.group(1))] = [c.strip() for c in m.group(2).split("|")]
+    assert rows == FIT_TABLE
+    assert re.search(r"^\| GPU memory \| 720p \| 1080p \| 1440p \| 4K \|", text, re.M)
+
+
+@pytest.mark.parametrize("w,h,mb,expect,warn", [
+    (1920, 1080, 4096, "1080p with 4 GB of GPU memory: Auto picks about 2/1 low-VRAM", False),
+    (1920, 1080, 3800, "1080p with 4 GB of GPU memory", False),                     # reports a little under 4 GiB
+    (3840, 2160, 4096, "not enough memory", True),
+    (1280, 536, 6144, "720p with 6 GB of GPU memory: Auto picks about 24/12 low-VRAM", False),
+    (2048, 1080, 8192, "1440p with 8 GB of GPU memory", False),                     # rounds up to the next column
+    (4096, 2160, 24576, "Larger than 4K", True),
+    (1920, 1080, 81920, "1080p with 48 GB or more of GPU memory: Auto picks about 80/40", False),
+    (1920, 1080, 2048, "Below the smallest card", True)])
+def test_fit_estimate(w, h, mb, expect, warn):
+    text, warning = fit_estimate(w, h, mb)
+    assert expect in text and warning == warn
 
 
 # ------------------------------------------------------------------------- media

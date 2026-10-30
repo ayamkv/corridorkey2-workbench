@@ -9,7 +9,12 @@ app runs the **unmodified** upstream code.
 
 ## Features
 
-- **Media bin.** Thumbnails, per-clip status (READY / QUEUED / % / DONE / ERROR), and drag & drop import of
+- **Projects.** A project is a folder: `project.json`, `renders\<clip>\render_NNN\` and `masks\<clip>\`.
+  - Paths inside it are stored relative, so the folder can be moved. Clips stay where they are.
+  - Switch projects from the top bar (New, Open, Recent, Show in Explorer). The last project reopens on launch.
+  - New projects never default to a nearly full system drive.
+  - Clips from before projects can be brought into a project once; their old renders stay where they are.
+- **Media bin.** Thumbnails, per-clip status (Ready / Held / Queued / % / Done / Error), and drag & drop import of
   videos or EXR/PNG/JPG sequence folders.
 - **GPU viewer (OpenGL).** Plate, Composite (foreground over a checkerboard), Matte, Foreground and Checker
   views, in Single, Wipe and Side-by-side layouts.
@@ -30,12 +35,17 @@ app runs the **unmodified** upstream code.
   - EXR half or full float (scene-linear, unclamped).
   - Or video: H.264 / H.265, 10-bit 4:4:4 down to 8-bit 4:2:0, CRF or bitrate, speed preset.
   - Upstream's defaults are marked, and Deliver says in one line exactly what a render writes.
-- **VRAM bar** in the status bar and the Inspector.
+- **VRAM bar** in the status bar and the Inspector, plus an approximate "what fits" line from upstream's
+  GPU memory table.
 - **Render engine in its own process.**
   - Queue with live progress, ETA, cancel and logs.
+  - **Render** starts as soon as the GPU is free. **Add to queue** holds a render until you press Start (or Start all).
+  - The queue shows every project's renders. Clicking one from another project opens that project, and a render
+    that finishes while another project is open is written into its own project file.
   - Renders keep going after you close the app, and the app picks them up when reopened.
   - Cancel stops the whole process tree, including ffmpeg encoders.
-- Each render goes to a new folder: `<clip folder>/<clip>_ck2/render_NNN`.
+- Each render goes to a new folder: `<project>\renders\<clip>\render_NNN`, or `<chosen folder>\<clip>_ck2\render_NNN`
+  if you pick an output folder.
 
 Progress and plans: see [ROADMAP.md](ROADMAP.md).
 
@@ -94,6 +104,8 @@ in **Settings**: the CorridorKey folder, its python, the cache/staging folder an
 | Right-click the top bar | Icons and labels, or icons only |
 | Ctrl+O | Import |
 | Ctrl+R | Render |
+| Ctrl+Shift+R | Add to queue (held until Start) |
+| Ctrl+Shift+N / Ctrl+Shift+O | New project / Open project |
 | Delete | Remove the clip (in the media bin) |
 
 ## Architecture
@@ -111,7 +123,8 @@ in **Settings**: the CorridorKey folder, its python, the cache/staging folder an
   - `timeline.py`
   - `frames.py`: one decode thread per file, plus a shared LRU cache.
   - `media.py`: frame numbering identical to upstream.
-  - `inspector.py`, `panels.py`, `main_window.py`
+  - `project.py`: the project folder and file, recent projects, where new projects go (no Qt).
+  - `inspector.py`, `panels.py`, `start.py`, `main_window.py`
 
 ## Tests
 

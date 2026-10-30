@@ -19,8 +19,9 @@ def app():
 
 
 @pytest.fixture
-def win(app, tmp_path, monkeypatch):
-    monkeypatch.setenv("CKSTUDIO_STATE", str(tmp_path / "state"))
+def bare(app, tmp_path, monkeypatch):
+    """The window as it first opens: no project yet."""
+    monkeypatch.setenv("CK2WB_STATE", str(tmp_path / "state"))
     from ckapp.app.main_window import MainWindow
     w = MainWindow()
     w.resize(1400, 850)
@@ -28,6 +29,13 @@ def win(app, tmp_path, monkeypatch):
     app.processEvents()
     yield w
     w.close()
+
+
+@pytest.fixture
+def win(bare, tmp_path, app):
+    assert bare.new_project(str(tmp_path / "proj")) is not None
+    app.processEvents()
+    return bare
 
 
 @pytest.fixture
@@ -40,7 +48,7 @@ def clip_path(tmp_path):
 
 def test_import_select_and_defaults(win, clip_path, app):
     added = win.import_paths([clip_path, clip_path, os.path.dirname(clip_path) + "/nope.txt"])
-    assert len(added) == 1 and len(win.session.clips) == 1        # duplicate + non-media skipped
+    assert len(added) == 1 and len(win.project.clips) == 1        # duplicate + non-media skipped
     app.processEvents()
     assert win.clip is added[0] and win.clip.frames == 120
     assert win.timeline.field.maximum() == 119
@@ -272,3 +280,117 @@ def test_settings_dialog_round_trip(app):
     d.fields["ffmpeg"].setText("C:/tools/ffmpeg.exe")
     s = d.result_settings()
     assert s.cache_dir == "D:/cache" and s.ffmpeg == "C:/tools/ffmpeg.exe" and s.ck_root == ""
+
+
+# ------------------------------------------------------------------------- projects
+def test_starts_on_the_start_page_and_reopens_the_last_project(bare, tmp_path, clip_path, app, monkeypatch):
+    from PySide6.QtWidgets import QDialog
+    from ckapp.app.main_window import MainWindow
+    assert bare.project is None and bare.pages.currentIndex() == 0
+    assert bare.bt_project.text() == "No project" and not bare.panel_toggles["media"].isVisible()
+    monkeypatch.setattr("ckapp.app.start.NewProjectDialog.exec", lambda self: QDialog.Rejected)
+    assert bare.import_paths([clip_path]) == []                       # no project: cancelled the dialog
+    p = bare.new_project(str(tmp_path / "Shoot day 1"))
+    clip = bare.import_paths([clip_path])[0]
+    assert bare.pages.currentIndex() == 1 and bare.windowTitle().startswith("Shoot day 1 - ")
+    assert clip.render_root() == os.path.join(p.root, "renders", "plate")
+    assert clip.next_render_dir()[0] == os.path.join(p.root, "renders", "plate", "render_001")
+    bare.close()
+    again = MainWindow()                                               # same state folder
+    try:
+        assert again.project is not None and again.project.path == p.path
+        assert [c.id for c in again.project.clips] == [clip.id] and again.clip.id == clip.id
+        again.close_project()
+        assert again.pages.currentIndex() == 0 and again.start.recent.count() == 1
+    finally:
+        again.close()
+
+
+def test_bring_in_old_session(bare, tmp_path, clip_path, app, monkeypatch):
+    import dataclasses
+    import json
+    from ckapp.app.model import Clip, Render
+    from ckapp.config import state_dir
+    old = Clip(clip_path, "video", 120, 24, 320, 180)
+    old.renders.append(Render("j1", str(tmp_path / "plate_ck2" / "render_001"), 0, 119, "video", status="done"))
+    (state_dir() / "session.json").write_text(json.dumps({"version": 1, "clips": [dataclasses.asdict(old)]}))
+    bare.close_project()
+    assert bare.start.bring.isVisibleTo(bare.start) and "Bring in my 1 clip " in bare.start.bring.text()
+    monkeypatch.setattr(bare, "_new_project_dialog", lambda: bare.new_project(str(tmp_path / "migrated")))
+    bare._bring_in()
+    assert len(bare.project.clips) == 1 and bare.clip.renders[0].out_dir == str(tmp_path / "plate_ck2" / "render_001")
+    assert (state_dir() / "session.migrated.json").exists() and not (state_dir() / "session.json").exists()
+
+
+def test_new_project_dialog_checks_the_name(app, tmp_path):
+    from ckapp.app.project import Project
+    from ckapp.app.start import NewProjectDialog
+    d = NewProjectDialog(str(tmp_path))
+    assert d.parent_dir() == str(tmp_path) and d.ed_name.text() == "Untitled project"
+    Project.create(tmp_path / "Taken")
+    for name, ok in (("", False), ("a:b", False), ("trailing.", False), ("Taken", False), ("Fine name", True)):
+        d.ed_name.setText(name)
+        assert (d.problem(name) is None) == ok, name
+        assert d.bb.buttons()[0].isEnabled() == ok or d.bb.buttons()[1].isEnabled() == ok
+
+
+def test_held_jobs_in_queue_and_bin(win, clip_path, app):
+    win.import_paths([clip_path])
+    clip = win.clip
+    from ckapp.app.model import Render
+    clip.renders.append(Render("h1", os.path.join(clip.render_root(), "render_001"), 0, 119, "video", status="held"))
+    job = {"id": "h1", "status": "held", "name": clip.name, "stage": "Waiting for Start", "spec": {}, "fraction": 0}
+    win.queue.reset([job])
+    win._refresh_clip_status(clip)
+    row = win.queue.rows["h1"]
+    assert row.start.isVisibleTo(row) and win.queue.start_all_btn.isVisibleTo(win.queue)
+    assert win.bin.info[clip.id]["status"] == "held"
+    removed = []
+    win.queue.removeRequested.connect(removed.append)
+    win.queue._clear_finished()
+    assert removed == []                                             # held jobs aren't finished
+    win._remove_clip(clip.id)
+    assert win.project.find(clip.id) is clip                         # can't remove a clip with held renders
+    win._job_updated(dict(job, status="queued", stage="Queued"))
+    assert not row.start.isVisibleTo(row) and not win.queue.start_all_btn.isVisibleTo(win.queue)
+    assert clip.renders[0].status == "queued"
+
+
+def test_add_to_queue_refused_by_an_older_engine(win, clip_path, app):
+    win.import_paths([clip_path])
+    sent = []
+    win.client.connected = True
+    win.client.info = {"host": "x", "port": 1, "token": "t", "version": "0.3.1"}
+    win.client.submit = lambda spec, done, hold=False: sent.append((spec, hold))
+    win._render(win.clip, hold=True)
+    assert sent == [] and "can't hold" in win.st_msg.text()
+    from ckapp import __version__
+    win.client.info["version"] = __version__
+    win._render(win.clip, hold=True)
+    spec, hold = sent[0]
+    assert hold and spec["project"] == str(win.project.path)
+    assert spec["output_dir"] == os.path.join(win.project.root, "renders", "plate", "render_001")
+
+
+def test_render_finishing_in_another_project_updates_its_file(win, tmp_path, clip_path, app):
+    from ckapp.app.model import Render
+    from ckapp.app.project import Project
+    win.import_paths([clip_path])
+    first = win.project
+    out = os.path.join(win.clip.render_root(), "render_001")
+    win.clip.renders.append(Render("r1", out, 0, 119, "video", status="running"))
+    first.save()
+    win.new_project(str(tmp_path / "second"))
+    job = {"id": "r1", "status": "done", "name": "plate.mp4", "outputs": {"fg": os.path.join(out, "plate_fg.mp4")},
+           "spec": {"project": str(first.path)}}
+    win._job_updated(job)
+    r = Project.open(first.path).clips[0].renders[0]
+    assert r.status == "done" and r.outputs["fg"] == os.path.join(out, "plate_fg.mp4")
+    win._job_activated("r1")                                        # clicking it opens its project
+    assert win.project.path == first.path and win.render.job_id == "r1"
+
+
+def test_gpu_fit_estimate_in_inspector(win, clip_path, app):
+    win.import_paths([clip_path])
+    win._system({"gpu": {"name": "GPU", "used_mb": 500, "total_mb": 4096, "util": 0}})
+    assert "720p with 4 GB of GPU memory" in win.inspector.lb_fits.text()

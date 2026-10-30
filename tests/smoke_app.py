@@ -2,7 +2,7 @@
 
     python tests/smoke_app.py <clip> <out_dir> [--render] [--frame N] [--layout single|wipe|side]
 
-Uses an isolated state folder (CKSTUDIO_STATE) unless one is already set.
+Uses an isolated state folder (CK2WB_STATE) unless one is already set, and a project in <out_dir>/project.
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def main() -> int:
     ap.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
                     help="clip settings, e.g. output_format=exr outputs=alpha,fg despill=0.3")
     args = ap.parse_args()
-    os.environ.setdefault("CKSTUDIO_STATE", tempfile.mkdtemp(prefix="ckstate-"))
+    os.environ.setdefault("CK2WB_STATE", tempfile.mkdtemp(prefix="ckstate-"))
     os.makedirs(args.out_dir, exist_ok=True)
 
     from PySide6.QtCore import QRectF, Qt, QTimer
@@ -54,6 +54,10 @@ def main() -> int:
     win.setWindowFlag(Qt.WindowTransparentForInput, True)      # nor stray mouse-wheel zooms
     win.show()
     win.client.connect_engine()
+    if win.project is None:
+        project_dir = os.path.join(args.out_dir, "project")
+        if not win.open_project(project_dir, quiet=True):
+            win.new_project(project_dir)
     clips = win.import_paths([args.clip])
     clip = clips[0] if clips else win.clip
     for kv in args.set:

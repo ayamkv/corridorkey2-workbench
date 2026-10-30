@@ -1,14 +1,12 @@
-"""Clips, their per-clip settings and renders, and the saved session. Qt-free."""
+"""Clips, their per-clip settings and renders. Qt-free. Projects (the saved file) live in project.py."""
 from __future__ import annotations
 
-import json
 import os
 import uuid
-from dataclasses import asdict, dataclass, field, fields
-from pathlib import Path
+from dataclasses import dataclass, field, fields
 from typing import Optional
 
-from ..engine.jobs import JobSpec
+from ..engine.jobs import PENDING, JobSpec
 from .media import ClipInfo
 
 
@@ -65,6 +63,39 @@ def describe_export(s: "ClipSettings") -> str:
     return text
 
 
+# What CorridorKey's automatic mode picks (window/stride, low-VRAM or not), from upstream's README table
+# "Long Clips And Low VRAM". Rows: GPU memory in GB. Columns: 720p, 1080p, 1440p, 4K. A test keeps it in sync.
+FIT_COLUMNS = [("720p", 1280 * 720), ("1080p", 1920 * 1080), ("1440p", 2560 * 1440), ("4K", 3840 * 2160)]
+FIT_TABLE = {
+    4: ["4/2 low-VRAM", "2/1 low-VRAM", "1/1 low-VRAM", "not enough memory"],
+    6: ["24/12 low-VRAM", "8/4 low-VRAM", "4/2 low-VRAM", "2/1 low-VRAM"],
+    8: ["24/12 low-VRAM", "8/4 low-VRAM", "8/4 low-VRAM", "4/2 low-VRAM"],
+    12: ["80/40 low-VRAM", "24/12 low-VRAM", "8/4", "8/4 low-VRAM"],
+    16: ["80/40", "48/24 low-VRAM", "24/12 low-VRAM", "8/4 low-VRAM"],
+    24: ["80/40", "48/24", "48/24 low-VRAM", "8/4"],
+    32: ["80/40", "80/40", "48/24", "24/12"],
+    48: ["80/40", "80/40", "80/40", "48/24 low-VRAM"],
+}
+
+
+def fit_estimate(width: int, height: int, total_mb: float) -> tuple[str, bool]:
+    """(sentence, is_warning) saying roughly what fits, from upstream's table. Cards report a little under their
+    nominal size (a "4 GB" card shows ~4 GiB minus the display), so rows match with 10% slack."""
+    pixels = width * height
+    col = next((i for i, (_, px) in enumerate(FIT_COLUMNS) if pixels <= px), None)
+    gb = total_mb / 1024
+    row = max((r for r in FIT_TABLE if gb >= r * 0.9), default=None)
+    if row is None:
+        return ("Below the smallest card in CorridorKey's guide (4 GB). Renders may run out of memory.", True)
+    if col is None:
+        return (f"Larger than 4K: beyond CorridorKey's guide. On {row} GB, expect low-VRAM mode at best.", True)
+    name, cell = FIT_COLUMNS[col][0], FIT_TABLE[row][col]
+    card = f"{row} GB" + (" or more" if row == max(FIT_TABLE) else "") + " of GPU memory"
+    if cell == "not enough memory":
+        return (f"{name} with {card}: not enough memory, per CorridorKey's guide. You can still try.", True)
+    return (f"{name} with {card}: Auto picks about {cell} (approximate, from CorridorKey's guide).", False)
+
+
 @dataclass
 class Render:
     job_id: str
@@ -89,12 +120,27 @@ class Clip:
     settings: ClipSettings = field(default_factory=ClipSettings)
     renders: list = field(default_factory=list)   # [Render], oldest first
     error: str = ""
+    folder: str = ""                              # renders/<folder> and masks/<folder> in the project; set once
+    base: str = field(default="", compare=False, repr=False)    # project root; not saved
+
+    SAVED = ("path", "kind", "frames", "fps", "width", "height", "id", "folder")
 
     @classmethod
     def from_info(cls, info: ClipInfo) -> "Clip":
         c = cls(info.path, info.kind, info.frames, info.fps, info.width, info.height)
         c.settings.frame_dir_fps = info.fps
         return c
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Clip":
+        """Raises TypeError/KeyError on a malformed entry."""
+        clip = cls(**{k: d[k] for k in cls.SAVED if k in d})
+        clip.settings = ClipSettings.from_dict(d.get("settings", {}))
+        known = {f.name for f in fields(Render)}
+        clip.renders = [Render(**{k: v for k, v in r.items() if k in known}) for r in d.get("renders", [])]
+        if not os.path.exists(clip.path):
+            clip.error = "missing"
+        return clip
 
     @property
     def name(self) -> str:
@@ -127,8 +173,19 @@ class Clip:
         return None
 
     def render_root(self) -> str:
-        base = self.settings.output_root or os.path.dirname(self.path.rstrip("/\\"))
-        return os.path.join(base, f"{self.stem}_ck2")
+        """<project>/renders/<folder>; a custom output folder, or (no project) next to the clip, gets <stem>_ck2."""
+        if self.settings.output_root:
+            return os.path.join(self.settings.output_root, f"{self.stem}_ck2")
+        if self.base and self.folder:
+            return os.path.join(self.base, "renders", self.folder)
+        return os.path.join(os.path.dirname(self.path.rstrip("/\\")), f"{self.stem}_ck2")
+
+    def masks_dir(self) -> str:
+        return os.path.join(self.base, "masks", self.folder) if self.base and self.folder else self.render_root()
+
+    def busy(self) -> bool:
+        """Has jobs the engine still owns (held, queued or running): the clip can't be removed."""
+        return any(r.status in PENDING for r in self.renders)
 
     def next_render_dir(self) -> tuple[str, str]:
         root = self.render_root()
@@ -139,7 +196,7 @@ class Clip:
             n += 1
         return os.path.join(root, f"render_{n:03d}"), f"Render {n}"
 
-    def to_spec(self, out_dir: str) -> JobSpec:
+    def to_spec(self, out_dir: str, project: str = "") -> JobSpec:
         s = self.settings
         first, last = self.frame_range()
         whole = first == 0 and last == self.last_frame
@@ -155,47 +212,4 @@ class Clip:
             low_vram=s.memory == "low" or (s.memory == "manual" and s.manual_low_vram),
             hann_chunk=s.hann_chunk, hann_stride=s.hann_stride,
             video_codec=s.video_codec, pix_fmt=s.pix_fmt, crf=s.crf, preset=s.preset,
-            bitrate=f"{s.bitrate_mbps:g}M" if s.rate_mode == "bitrate" else "")
-
-
-class Session:
-    def __init__(self, path: Path):
-        self.path = path
-        self.clips: list[Clip] = []
-
-    def find(self, clip_id: str) -> Optional[Clip]:
-        return next((c for c in self.clips if c.id == clip_id), None)
-
-    def find_job(self, job_id: str) -> tuple[Optional[Clip], Optional[Render]]:
-        for c in self.clips:
-            for r in c.renders:
-                if r.job_id == job_id:
-                    return c, r
-        return None, None
-
-    def save(self) -> None:
-        data = {"version": 1, "clips": [asdict(c) for c in self.clips]}
-        tmp = self.path.with_suffix(".tmp")
-        try:
-            tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
-            os.replace(tmp, self.path)
-        except OSError:
-            pass
-
-    def load(self) -> None:
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return
-        for d in data.get("clips", []):
-            try:
-                settings = ClipSettings.from_dict(d.pop("settings", {}))
-                renders = [Render(**r) for r in d.pop("renders", [])]
-                known = {f.name for f in fields(Clip)}
-                clip = Clip(**{k: v for k, v in d.items() if k in known})
-                clip.settings, clip.renders = settings, renders
-            except TypeError:
-                continue
-            if not os.path.exists(clip.path):
-                clip.error = "missing"
-            self.clips.append(clip)
+            bitrate=f"{s.bitrate_mbps:g}M" if s.rate_mode == "bitrate" else "", project=project)

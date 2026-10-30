@@ -9,7 +9,7 @@ from PySide6.QtCore import QSettings, QSize, QTimer, Qt, QUrl
 from PySide6.QtGui import QAction, QCursor, QDesktopServices, QFont, QFontMetrics, QKeySequence, QShortcut, QTextCursor
 from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
                                QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy,
-                               QSplitter, QToolButton, QVBoxLayout, QWidget)
+                               QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget)
 
 from .. import APP_NAME, __version__
 from ..config import Settings, load_settings, save_settings, state_dir
@@ -19,8 +19,11 @@ from .client import EngineClient
 from .frames import FrameProvider
 from .inspector import Inspector
 from .media import is_media, probe
-from .model import Clip, Render, Session
+from ..engine.jobs import FINISHED, PENDING
+from .model import Clip, Render
 from .panels import MediaBin, QueuePanel, ThumbLoader
+from .project import Project, ProjectError, Recent, session_clips
+from .start import NewProjectDialog, StartPage
 from .timeline import Timeline
 from .viewer import MODE_COLOR, MODE_COMPOSITE, MODE_MATTE, GLViewer, Side
 from .widgets import Segmented, VramMeter, combo, hline, icon_button, label, styled_popup, vline
@@ -30,14 +33,21 @@ VIEWS = [("plate", "Plate"), ("composite", "Composite"), ("matte", "Matte"), ("f
 VIEW_LABEL = dict(VIEWS)
 
 
+def _existing_parent(path: str) -> str:
+    """The render folder may not exist yet; free space is measured on its nearest existing parent."""
+    while path and not os.path.exists(path) and os.path.dirname(path) != path:
+        path = os.path.dirname(path)
+    return path
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} {__version__} (unofficial)")
         self.resize(1500, 900)
         self.setAcceptDrops(True)
         self.settings = load_settings().resolved()
-        self.session = Session(state_dir() / "session.json")
+        self.project: Optional[Project] = None
+        self.recent = Recent(state_dir() / "recent.json")
         self.frames = FrameProvider(parent=self)
         self.thumbs = ThumbLoader(self)
         self.client = EngineClient(self)
@@ -53,19 +63,135 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._wire()
         self._shortcuts()
-        self._save_timer = QTimer(self, singleShot=True, interval=600, timeout=self.session.save)
+        self._save_timer = QTimer(self, singleShot=True, interval=600, timeout=self._save_project)
         self._play_timer = QTimer(self, timeout=self._tick)
         self._play_timer.setTimerType(Qt.PreciseTimer)
 
-        self.session.load()
-        for c in self.session.clips:
-            self._add_to_bin(c)
-        if self.session.clips:
-            self.bin.select(self.session.clips[0].id)
-        else:
-            self._select_clip(None)
         self.restore_layout()
         self._sync_zoom_box()
+        last = self.recent.existing()
+        if not (last and self.open_project(last[0], quiet=True)):     # reopen the last project, like before
+            self.close_project()
+
+    # ================================================================== projects
+    def _session_file(self):
+        return state_dir() / "session.json"
+
+    def _save_project(self) -> None:
+        if self.project is not None and not self.project.save():
+            self._message(f"Cannot save {self.project.path}", error=True)
+
+    def _show_project(self, project: Project) -> None:
+        self.stop()
+        self.project = project
+        self.strips.clear()
+        self.bin.clear()
+        for c in project.clips:
+            self._add_to_bin(c)
+        if project.clips:
+            self.bin.select(project.clips[0].id)
+        else:
+            self._select_clip(None)
+        self.recent.add(str(project.path))
+        self.pages.setCurrentIndex(1)
+        self._sync_project_ui()
+        self._reconcile()
+
+    def open_project(self, path: str, quiet: bool = False) -> bool:
+        if self.project is not None and os.path.normcase(str(self.project.path)) == os.path.normcase(
+                os.path.abspath(os.path.join(path, "project.json") if os.path.isdir(path) else path)):
+            return True
+        try:
+            project = Project.open(path)
+        except ProjectError as e:
+            if not os.path.exists(path):
+                self.recent.remove(path)
+            if not quiet:
+                QMessageBox.warning(self, "Can't open project", str(e))
+            return False
+        self._save_project()
+        self._show_project(project)
+        return True
+
+    def new_project(self, folder: str) -> Optional[Project]:
+        try:
+            project = Project.create(folder)
+        except ProjectError as e:
+            QMessageBox.warning(self, "Can't create project", str(e))
+            return None
+        self.recent.last_parent = os.path.dirname(os.path.abspath(folder))
+        self._save_project()
+        self._show_project(project)
+        return project
+
+    def close_project(self) -> None:
+        self._save_project()
+        self.stop()
+        self.project = None
+        self.strips.clear()
+        self.bin.clear()
+        self._select_clip(None)
+        self.start.set_recent(self.recent.existing())
+        self.start.set_bring_in(len(session_clips(self._session_file())))
+        self.pages.setCurrentIndex(0)
+        self._sync_project_ui()
+
+    def _sync_project_ui(self) -> None:
+        p = self.project
+        name = p.name if p else ""
+        self.setWindowTitle(f"{name} - {APP_NAME} {__version__} (unofficial)" if p
+                            else f"{APP_NAME} {__version__} (unofficial)")
+        self.bt_project.setText(name or "No project")
+        self.bt_project.setToolTip(f"Project: {p.root}" if p else "Create or open a project")
+        for b in self.panel_toggles.values():
+            b.setVisible(p is not None)
+
+    def _new_project_dialog(self) -> Optional[Project]:
+        dlg = NewProjectDialog(self.recent.last_parent, self)
+        if dlg.exec() != QDialog.Accepted:
+            return None
+        return self.new_project(dlg.folder())
+
+    def _open_project_dialog(self) -> None:
+        start = os.path.dirname(self.project.root) if self.project else self.recent.last_parent
+        path, _ = QFileDialog.getOpenFileName(self, "Open project", start, "Project (project.json)")
+        if path:
+            self.open_project(path)
+
+    def _bring_in(self) -> None:
+        if self._new_project_dialog() is None:
+            return
+        try:
+            n = self.project.bring_in(self._session_file())
+        except ProjectError as e:
+            QMessageBox.warning(self, "Can't bring the clips in", str(e))
+            return
+        self._show_project(self.project)
+        self._message(f"Brought in {n} clip{'s' if n != 1 else ''}. Their earlier renders stay where they were; "
+                      "new renders go into the project.")
+
+    def _project_menu(self) -> None:
+        m = QMenu(self)
+        m.addAction("New project…", self._new_project_dialog).setShortcut(QKeySequence("Ctrl+Shift+N"))
+        m.addAction("Open project…", self._open_project_dialog).setShortcut(QKeySequence("Ctrl+Shift+O"))
+        rec = m.addMenu("Recent")
+        current = os.path.normcase(str(self.project.path)) if self.project else ""
+        items = [p for p in self.recent.existing() if os.path.normcase(p) != current]
+        for p in items:
+            rec.addAction(os.path.basename(os.path.dirname(p)), lambda q=p: self.open_project(q)).setToolTip(p)
+        rec.setToolTipsVisible(True)
+        rec.setEnabled(bool(items))
+        m.addSeparator()
+        a = m.addAction("Show in Explorer",
+                        lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(self.project.root)))
+        a.setEnabled(self.project is not None)
+        a = m.addAction("Close project", self.close_project)
+        a.setEnabled(self.project is not None)
+        m.exec(self.bt_project.mapToGlobal(self.bt_project.rect().bottomLeft()))
+
+    def _ensure_project(self) -> bool:
+        """Clips need a project: offer to create one."""
+        return self.project is not None or self._new_project_dialog() is not None
 
     # ================================================================== layout
     def _build_ui(self) -> None:
@@ -110,7 +236,11 @@ class MainWindow(QMainWindow):
         main.addWidget(self.inspector)
         main.setStretchFactor(1, 1)
         main.setSizes([300, 900, 340])
-        v.addWidget(main, 1)
+        self.start = StartPage()
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self.start)
+        self.pages.addWidget(main)
+        v.addWidget(self.pages, 1)
         self.setCentralWidget(root)
 
         sb = self.statusBar()
@@ -132,6 +262,15 @@ class MainWindow(QMainWindow):
         # one rich-text label so both parts share a baseline
         h.addWidget(label(f"{APP_NAME}&nbsp;&nbsp;<span style='font-size:8.5pt; font-weight:400; "
                           f"color:{T.c('TEXT_FAINT')}'>unofficial</span>", "Brand"))
+        h.addWidget(vline())
+        self.bt_project = QToolButton()
+        self.bt_project.setObjectName("Toggle")
+        self.bt_project.setProperty("plain", True)
+        self.bt_project.setIcon(icons.svg("folder-open", "TEXT_DIM", 16, hover="TEXT"))
+        self.bt_project.setIconSize(QSize(16, 16))
+        self.bt_project.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.bt_project.clicked.connect(self._project_menu)
+        h.addWidget(self.bt_project)
         h.addStretch(1)
         self.title = label("", "Title")
         h.addWidget(self.title)
@@ -286,9 +425,13 @@ class MainWindow(QMainWindow):
 
     # ================================================================== wiring
     def _wire(self) -> None:
-        self.bin.clipSelected.connect(lambda cid: self._select_clip(self.session.find(cid)))
+        self.start.newRequested.connect(self._new_project_dialog)
+        self.start.openRequested.connect(self._open_project_dialog)
+        self.start.recentChosen.connect(self.open_project)
+        self.start.bringInRequested.connect(self._bring_in)
+        self.bin.clipSelected.connect(lambda cid: self._select_clip(self.project and self.project.find(cid)))
         self.bin.importRequested.connect(self._import_dialog)
-        self.bin.renderRequested.connect(lambda cid: self._render(self.session.find(cid)))
+        self.bin.renderRequested.connect(lambda cid: self._render(self.project and self.project.find(cid)))
         self.bin.removeRequested.connect(self._remove_clip)
         self.bin.revealRequested.connect(self._reveal_clip)
         self.thumbs.thumbReady.connect(self.bin.set_thumb)
@@ -299,6 +442,7 @@ class MainWindow(QMainWindow):
         self.inspector.changed.connect(self._settings_changed)
         self.inspector.rangeEdited.connect(self._sync_range_to_timeline)
         self.inspector.renderRequested.connect(lambda: self._render(self.clip))
+        self.inspector.queueRequested.connect(lambda: self._render(self.clip, hold=True))
         self.inspector.setInRequested.connect(lambda: self._set_point("in"))
         self.inspector.setOutRequested.connect(lambda: self._set_point("out"))
 
@@ -320,6 +464,8 @@ class MainWindow(QMainWindow):
 
         self.queue.cancelRequested.connect(self.client.cancel)
         self.queue.removeRequested.connect(self.client.remove)
+        self.queue.startRequested.connect(self.client.start)
+        self.queue.startAllRequested.connect(self.client.start_all)
         self.queue.jobActivated.connect(self._job_activated)
         self.client.connectedChanged.connect(self._engine_connected)
         self.client.jobsReset.connect(self._jobs_reset)
@@ -351,6 +497,9 @@ class MainWindow(QMainWindow):
         sc("3", lambda: self.seg_layout.set_current(GLViewer.SIDE, emit=True))
         sc("Ctrl+O", self._import_dialog)
         sc("Ctrl+R", lambda: self._render(self.clip))
+        sc("Ctrl+Shift+R", lambda: self._render(self.clip, hold=True))
+        sc("Ctrl+Shift+N", self._new_project_dialog)
+        sc("Ctrl+Shift+O", self._open_project_dialog)
         for keys, name in (("Ctrl+1", "media"), ("Ctrl+2", "queue"), ("Ctrl+3", "inspector")):
             sc(keys, lambda n=name: self.panel_toggles[n].toggle())
         act = QAction(self)
@@ -361,6 +510,8 @@ class MainWindow(QMainWindow):
 
     # ================================================================== clips
     def _import_dialog(self) -> None:
+        if not self._ensure_project():
+            return
         start = os.path.dirname(self.clip.path) if self.clip else ""
         files, _ = QFileDialog.getOpenFileNames(
             self, "Import clips", start,
@@ -371,8 +522,10 @@ class MainWindow(QMainWindow):
         self.import_paths(files)
 
     def import_paths(self, paths: list[str]) -> list[Clip]:
+        if not paths or not self._ensure_project():
+            return []
         added, skipped = [], []
-        known = {os.path.normcase(os.path.abspath(c.path)) for c in self.session.clips}
+        known = {os.path.normcase(os.path.abspath(c.path)) for c in self.project.clips}
         for p in paths:
             p = os.path.normpath(p)
             if os.path.normcase(os.path.abspath(p)) in known:
@@ -385,7 +538,7 @@ class MainWindow(QMainWindow):
             except ValueError as e:
                 skipped.append(f"{os.path.basename(p)} ({e})")
                 continue
-            self.session.clips.append(clip)
+            self.project.add(clip)
             known.add(os.path.normcase(os.path.abspath(p)))
             self._add_to_bin(clip)
             added.append(clip)
@@ -403,17 +556,17 @@ class MainWindow(QMainWindow):
         self._refresh_clip_status(clip)
 
     def _remove_clip(self, clip_id: str) -> None:
-        clip = self.session.find(clip_id)
+        clip = self.project and self.project.find(clip_id)
         if clip is None:
             return
-        if any(r.status in ("queued", "running") for r in clip.renders):
-            self._message("This clip is still rendering; cancel its job first.", error=True)
+        if clip.busy():
+            self._message("This clip has renders in the queue; cancel them first.", error=True)
             return
-        self.session.clips.remove(clip)
+        self.project.clips.remove(clip)
         self.bin.remove(clip_id)
         self.strips.pop(clip_id, None)
         if self.clip is clip:
-            nxt = self.session.clips[0] if self.session.clips else None
+            nxt = self.project.clips[0] if self.project.clips else None
             if nxt:
                 self.bin.select(nxt.id)
             else:
@@ -421,7 +574,7 @@ class MainWindow(QMainWindow):
         self._save_timer.start()
 
     def _reveal_clip(self, clip_id: str) -> None:
-        clip = self.session.find(clip_id)
+        clip = self.project and self.project.find(clip_id)
         if clip:
             folder = clip.render_root() if os.path.isdir(clip.render_root()) else os.path.dirname(clip.path)
             QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
@@ -444,7 +597,7 @@ class MainWindow(QMainWindow):
         if clip.id not in self.strips and not clip.error:
             self.thumbs.strip(clip.id, clip.path, clip.frames, linear=clip.settings.frame_dir_linear)
         self.lb_fps.setText(f"{clip.fps:g} fps")
-        self.client.disk_path = clip.render_root()
+        self.client.disk_path = _existing_parent(clip.render_root())
         self.client.poll_system()
         self._sync_range_to_timeline()
         self.render = clip.latest_render()
@@ -460,7 +613,7 @@ class MainWindow(QMainWindow):
     def _settings_changed(self) -> None:
         self._save_timer.start()
         if self.clip:
-            self.client.disk_path = self.clip.render_root()
+            self.client.disk_path = _existing_parent(self.clip.render_root())
 
     # ================================================================== range
     def _sync_range_to_timeline(self) -> None:
@@ -710,40 +863,62 @@ class MainWindow(QMainWindow):
         if self.render:
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.render.out_dir))
 
-    def _render(self, clip: Optional[Clip]) -> None:
-        if clip is None:
+    def _render(self, clip: Optional[Clip], hold: bool = False) -> None:
+        """Render now (or when the GPU is free), or with `hold` add to the queue to Start later."""
+        if clip is None or self.project is None:
             return
         if not self.client.connected:
             self._message("The render engine is not connected yet.", error=True)
             return
+        if hold and not self.client.can_hold():
+            self._message(f"The running engine ({self.client.engine_version or 'older version'}) can't hold renders "
+                          "and would start this one at once. Use Render, or let its renders finish and restart the "
+                          "app.", error=True)
+            return
         if not clip.settings.outputs:
             self._message("Pick at least one output.", error=True)
             return
+        project = self.project
         out_dir, label_ = clip.next_render_dir()
-        spec = clip.to_spec(out_dir)
+        spec = clip.to_spec(out_dir, project=str(project.path))
         first, last = clip.frame_range()
 
         def done(job: dict) -> None:
             r = Render(job_id=job["id"], out_dir=out_dir, frame_in=first, frame_out=last,
                        output_format=spec.output_format, status=job["status"], label=label_)
             clip.renders.append(r)
+            if project is not self.project:          # switched projects while the request was out
+                project.save()
+                return
             self._save_timer.start()
             self._refresh_clip_status(clip)
             if clip is self.clip:
                 self._fill_render_box()
                 self.inspector.set_clip(clip)          # next render number in the summary
-            self._message(f"Queued {clip.name} ({label_}, frames {first}–{last})")
-        self.client.submit(asdict(spec), done)
+            verb = "Added to the queue" if job["status"] == "held" else "Queued"
+            self._message(f"{verb}: {clip.name} ({label_}, frames {first}–{last})")
+        self.client.submit(asdict(spec), done, hold=hold)
+
+    def _reconcile(self) -> None:
+        """Bring the open project's renders up to date with the engine (only while connected: an offline engine
+        says nothing about which renders were interrupted)."""
+        if self.project is not None and self.client.connected:
+            self.client.list_jobs(self._apply_job_list)
 
     def _jobs_reset(self, jobs: list) -> None:
         self.queue.reset(jobs)
+        self._apply_job_list(jobs)
+
+    def _apply_job_list(self, jobs: list) -> None:
+        if self.project is None or not isinstance(jobs, list):
+            return
         by_id = {j["id"]: j for j in jobs}
-        for c in self.session.clips:
+        for c in self.project.clips:
             for r in c.renders:
                 j = by_id.get(r.job_id)
                 if j:
                     self._apply_job(c, r, j)
-                elif r.status in ("queued", "running"):
+                elif r.status in PENDING:
                     r.status = "interrupted"
             self._refresh_clip_status(c)
         self._save_timer.start()
@@ -757,29 +932,47 @@ class MainWindow(QMainWindow):
                 if not latest.frame_in <= self.frame <= latest.frame_out:
                     self.set_frame(latest.frame_in)
                 self.update_viewer()
+            elif self.render is not None:
+                self._fill_render_box()
 
     def _job_updated(self, job: dict) -> None:
         self.queue.update_job(job)
-        clip, r = self.session.find_job(job["id"])
-        if clip and r:
-            was = r.status
-            self._apply_job(clip, r, job)
-            self._refresh_clip_status(clip)
-            if r.status != was:
-                self._save_timer.start()
-                if r.status == "done":
-                    self._message(f"Finished {clip.name} ({r.label})")
-                    if clip is self.clip:
-                        self.render = r
-                        self._shown.clear()
-                        self._fill_render_box()
-                        if not r.frame_in <= self.frame <= r.frame_out:
-                            self.set_frame(r.frame_in)
-                        self.update_viewer()
-                elif r.status == "error":
-                    self._message(f"{clip.name} failed: {job.get('error', '')}", error=True)
-                if clip is self.clip and r.status != "done":
+        clip, r = self.project.find_job(job["id"]) if self.project else (None, None)
+        if not (clip and r):
+            self._update_other_project(job)
+            return
+        was = r.status
+        self._apply_job(clip, r, job)
+        self._refresh_clip_status(clip)
+        if r.status != was:
+            self._save_timer.start()
+            if r.status == "done":
+                self._message(f"Finished {clip.name} ({r.label})")
+                if clip is self.clip:
+                    self.render = r
+                    self._shown.clear()
                     self._fill_render_box()
+                    if not r.frame_in <= self.frame <= r.frame_out:
+                        self.set_frame(r.frame_in)
+                    self.update_viewer()
+            elif r.status == "error":
+                self._message(f"{clip.name} failed: {job.get('error', '')}", error=True)
+            if clip is self.clip and r.status != "done":
+                self._fill_render_box()
+
+    def _update_other_project(self, job: dict) -> None:
+        """A render of a project that isn't open finished: write it into that project's file."""
+        path = (job.get("spec") or {}).get("project", "")
+        if job.get("status") not in FINISHED or not path or not os.path.isfile(path):
+            return
+        try:
+            other = Project.open(path)
+        except ProjectError:
+            return
+        clip, r = other.find_job(job["id"])
+        if clip and r and (r.status != job["status"] or (job.get("outputs") and r.outputs != job["outputs"])):
+            self._apply_job(clip, r, job)
+            other.save()
 
     def _apply_job(self, clip: Clip, r: Render, job: dict) -> None:
         r.status = job["status"]
@@ -793,17 +986,26 @@ class MainWindow(QMainWindow):
         running = next((r for r in clip.renders if r.status == "running"), None)
         if running:
             return self.bin.set_status(clip.id, "running", self.job_fraction.get(running.job_id, 0.0))
-        if any(r.status == "queued" for r in clip.renders):
-            return self.bin.set_status(clip.id, "queued")
+        for status in ("queued", "held"):
+            if any(r.status == status for r in clip.renders):
+                return self.bin.set_status(clip.id, status)
         last = clip.renders[-1] if clip.renders else None
         if last and last.status == "error":
             return self.bin.set_status(clip.id, "error")
         self.bin.set_status(clip.id, "done" if clip.latest_render() else "ready")
 
+
     def _job_activated(self, job_id: str) -> None:
-        clip, r = self.session.find_job(job_id)
+        clip, r = self.project.find_job(job_id) if self.project else (None, None)
         if clip is None:
-            return
+            row = self.queue.rows.get(job_id)
+            path = (row.job.get("spec") or {}).get("project", "") if row else ""
+            if not path or not os.path.isfile(path) or not self.open_project(path):
+                return
+            self._message(f"Opened {self.project.name}, the project this render belongs to.")
+            clip, r = self.project.find_job(job_id)
+            if clip is None:
+                return
         if clip is not self.clip:
             self.bin.select(clip.id)
         if r and r.status == "done":
@@ -813,7 +1015,6 @@ class MainWindow(QMainWindow):
             self.set_frame(r.frame_in)
         elif r and r.status == "error":
             self.client.fetch_log(job_id, self._show_log)
-
     def _show_log(self, job: dict) -> None:
         d = QDialog(self)
         d.setWindowTitle(f"Log: {job.get('name', '')}")
@@ -893,7 +1094,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, e) -> None:
         self.stop()
         self.save_layout()
-        self.session.save()
+        self._save_project()
         self.client.close()
         self.frames.shutdown()
         self.thumbs.shutdown()
