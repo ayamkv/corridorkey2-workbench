@@ -185,6 +185,21 @@ Decisions made:
   - Remote apps upload clips with chunked transfer and download the outputs.
   - Off by default.
 
+## Phase 3 decisions: projects (2026-10-30)
+- **The last project reopens on launch.** That matches the old behaviour, where the single session always
+  loaded. The start page appears only when there's no project, or after Close project.
+- **Paths: relative inside the project, absolute outside.** In memory every path is absolute; `project.py`
+  converts on save and load. Renders from before projects, custom output folders and other drives stay absolute.
+  The engine's job history keeps the absolute paths it wrote to, so outputs it reports are re-rooted onto the
+  render's current `out_dir` (`_reroot` in `main_window.py`) in case the project moved.
+- **Clip folder names are fixed once** and never reuse a folder that already exists on disk. A removed and
+  re-added clip gets a new folder, so its renders never mix with the old ones.
+- **Add to queue is refused when the engine is older than the app.** Older engines ignore `"hold"` and would start
+  the render at once. A busy older engine is kept running so its renders finish, so this can happen.
+- **Renders that finish for a project that isn't open are written into that project's file**: on live events,
+  and on the engine's hello after a relaunch. Otherwise Clear finished could make the engine forget them first.
+- **`project.json` has its own format version.** A newer file is refused rather than opened and saved over.
+
 ## Verification
 - Phase 1: the CLI smoke test writes `_alpha.mp4` and `_fg.mp4`. `nvidia-smi` shows peak VRAM under 4 GB.
 - Phase 2:

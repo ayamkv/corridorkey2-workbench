@@ -163,7 +163,9 @@ def test_bring_in_old_session(tmp_path):
     assert not session.exists() and (session.parent / "session.migrated.json").exists()
     c = Project.open(p.path).clips[0]
     assert c.renders[0].out_dir == str(tmp_path / "shot_ck2" / "render_001")      # renders stay where they are
-    assert c.next_render_dir()[0] == os.path.join(p.root, "renders", "shot", "render_001")
+    assert c.renders[0].label == ""                                  # this one had no label; a labelled one:
+    c.renders[0].label = "Render 1"
+    assert c.next_render_dir() == (os.path.join(p.root, "renders", "shot", "render_002"), "Render 2")
 
 
 def test_recent_list(tmp_path):

@@ -33,6 +33,19 @@ VIEWS = [("plate", "Plate"), ("composite", "Composite"), ("matte", "Matte"), ("f
 VIEW_LABEL = dict(VIEWS)
 
 
+def _reroot(path: str, job_dir: str, out_dir: str) -> str:
+    """The engine remembers where it wrote; if the project moved since, the file is now under the render's out_dir."""
+    if not job_dir or not out_dir:
+        return path
+    try:
+        rel = os.path.relpath(path, job_dir)
+    except ValueError:                   # another drive
+        return path
+    if rel.startswith(".."):
+        return path
+    return os.path.normpath(os.path.join(out_dir, rel))
+
+
 def _existing_parent(path: str) -> str:
     """The render folder may not exist yet; free space is measured on its nearest existing parent."""
     while path and not os.path.exists(path) and os.path.dirname(path) != path:
@@ -908,6 +921,8 @@ class MainWindow(QMainWindow):
     def _jobs_reset(self, jobs: list) -> None:
         self.queue.reset(jobs)
         self._apply_job_list(jobs)
+        mine = {r.job_id for c in self.project.clips for r in c.renders} if self.project else set()
+        self._update_other_projects([j for j in jobs if j["id"] not in mine])
 
     def _apply_job_list(self, jobs: list) -> None:
         if self.project is None or not isinstance(jobs, list):
@@ -939,7 +954,7 @@ class MainWindow(QMainWindow):
         self.queue.update_job(job)
         clip, r = self.project.find_job(job["id"]) if self.project else (None, None)
         if not (clip and r):
-            self._update_other_project(job)
+            self._update_other_projects([job])
             return
         was = r.status
         self._apply_job(clip, r, job)
@@ -960,25 +975,38 @@ class MainWindow(QMainWindow):
             if clip is self.clip and r.status != "done":
                 self._fill_render_box()
 
-    def _update_other_project(self, job: dict) -> None:
-        """A render of a project that isn't open finished: write it into that project's file."""
-        path = (job.get("spec") or {}).get("project", "")
-        if job.get("status") not in FINISHED or not path or not os.path.isfile(path):
-            return
-        try:
-            other = Project.open(path)
-        except ProjectError:
-            return
-        clip, r = other.find_job(job["id"])
-        if clip and r and (r.status != job["status"] or (job.get("outputs") and r.outputs != job["outputs"])):
-            self._apply_job(clip, r, job)
-            other.save()
-
+    def _update_other_projects(self, jobs: list) -> None:
+        """Finished renders of projects that aren't open (live, or while the app was closed): write them into their
+        own project files, once per file, so they survive the engine forgetting the job (Clear finished)."""
+        by_project: dict[str, list] = {}
+        for job in jobs:
+            path = (job.get("spec") or {}).get("project", "")
+            if job.get("status") in FINISHED and path:
+                by_project.setdefault(os.path.normcase(os.path.abspath(path)), []).append(job)
+        for path, group in by_project.items():
+            if self.project is not None and os.path.normcase(str(self.project.path)) == path:
+                continue
+            if not os.path.isfile(path):
+                continue
+            try:
+                other = Project.open(path)
+            except ProjectError:
+                continue
+            changed = False
+            for job in group:
+                clip, r = other.find_job(job["id"])
+                if clip and r:
+                    before = (r.status, dict(r.outputs))
+                    self._apply_job(clip, r, job)
+                    changed |= (r.status, r.outputs) != before
+            if changed:
+                other.save()
     def _apply_job(self, clip: Clip, r: Render, job: dict) -> None:
         r.status = job["status"]
         self.job_fraction[r.job_id] = job.get("fraction", 0.0)
         if job.get("outputs"):
-            r.outputs = dict(job["outputs"])
+            r.outputs = {k: _reroot(p, (job.get("spec") or {}).get("output_dir", ""), r.out_dir)
+                         for k, p in job["outputs"].items()}
 
     def _refresh_clip_status(self, clip: Clip) -> None:
         if clip.error:
@@ -1065,7 +1093,9 @@ class MainWindow(QMainWindow):
             e.acceptProposedAction()
 
     def dropEvent(self, e) -> None:
-        self.import_paths([u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()])
+        paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+        # after the drop returns: a dialog (New project) inside it would leave Explorer stuck mid-drag
+        QTimer.singleShot(0, lambda: self.import_paths(paths))
 
     # ================================================================== layout memory
     def _ui_settings(self) -> QSettings:

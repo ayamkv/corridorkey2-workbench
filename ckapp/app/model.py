@@ -190,7 +190,8 @@ class Clip:
     def next_render_dir(self) -> tuple[str, str]:
         root = self.render_root()
         n = 1
-        while os.path.exists(os.path.join(root, f"render_{n:03d}")) or any(
+        labels = {r.label for r in self.renders}       # renders from before projects live elsewhere but keep labels
+        while os.path.exists(os.path.join(root, f"render_{n:03d}")) or f"Render {n}" in labels or any(
                 os.path.normcase(r.out_dir) == os.path.normcase(os.path.join(root, f"render_{n:03d}"))
                 for r in self.renders):
             n += 1

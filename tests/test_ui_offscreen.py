@@ -394,3 +394,38 @@ def test_gpu_fit_estimate_in_inspector(win, clip_path, app):
     win.import_paths([clip_path])
     win._system({"gpu": {"name": "GPU", "used_mb": 500, "total_mb": 4096, "util": 0}})
     assert "720p with 4 GB of GPU memory" in win.inspector.lb_fits.text()
+
+def test_moved_project_keeps_its_outputs_when_the_engine_reports_old_paths(win, tmp_path, clip_path, app):
+    import shutil
+    from ckapp.app.model import Render
+    win.import_paths([clip_path])
+    old_root = win.project.root
+    out = os.path.join(win.clip.render_root(), "render_001")
+    win.clip.renders.append(Render("m1", out, 0, 119, "video", status="done",
+                                   outputs={"fg": os.path.join(out, "plate_fg.mp4")}))
+    win.close_project()
+    shutil.move(old_root, str(tmp_path / "moved"))
+    assert win.open_project(str(tmp_path / "moved"))
+    job = {"id": "m1", "status": "done", "spec": {"output_dir": out, "project": os.path.join(old_root, "project.json")},
+           "outputs": {"fg": os.path.join(out, "plate_fg.mp4"), "alpha": os.path.join(out, "plate_alpha.mp4")}}
+    win._apply_job_list([job])
+    new_out = os.path.join(str(tmp_path / "moved"), "renders", "plate", "render_001")
+    r = win.clip.renders[0]
+    assert r.out_dir == new_out and r.outputs == {"fg": os.path.join(new_out, "plate_fg.mp4"),
+                                                  "alpha": os.path.join(new_out, "plate_alpha.mp4")}
+
+
+def test_renders_finished_while_closed_reach_their_own_project(win, tmp_path, clip_path, app):
+    from ckapp.app.model import Render
+    from ckapp.app.project import Project
+    win.import_paths([clip_path])
+    a = win.project
+    out = os.path.join(win.clip.render_root(), "render_001")
+    win.clip.renders.append(Render("c1", out, 0, 119, "video", status="running"))
+    a.save()
+    win.new_project(str(tmp_path / "b"))
+    job = {"id": "c1", "status": "done", "name": "plate.mp4", "stage": "", "fraction": 1,
+           "spec": {"project": str(a.path), "output_dir": out}, "outputs": {"fg": os.path.join(out, "plate_fg.mp4")}}
+    win._jobs_reset([job])                                           # the engine's hello after a relaunch
+    r = Project.open(a.path).clips[0].renders[0]
+    assert r.status == "done" and r.outputs == {"fg": os.path.join(out, "plate_fg.mp4")}
