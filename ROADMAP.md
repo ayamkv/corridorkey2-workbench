@@ -4,9 +4,13 @@ CorridorKey2 Workbench: an unofficial native desktop app for
 [CorridorKey 2.0](https://github.com/nikopueringer/CorridorKey2.0).
 Check items off as they land. Decisions and the reasons for them live in `PLAN.md`.
 
-## Where we left off (2026-11-04)
+## Where we left off (2026-11-06)
 
 Read this first when picking the work back up.
+
+**Next up:** finish the two hands-on checks under "Still pending", merge `phase-3-4` into `main`, then start Phase 5
+(LAN hosting). Its plan is ready in `PLAN.md`. Don't cut the `phase-5` branch before the merge, because fixes from the
+hands-on checks land on `phase-3-4`.
 
 **State of the code**
 - `main` is 0.3.1, pushed to the private repo https://github.com/ayamkv/corridorkey2-workbench. 0.3.1 is the studio installer:
@@ -43,6 +47,14 @@ Read this first when picking the work back up.
 - [ ] Rename the folder `D:\CODE\corridorkey2webui` to `D:\CODE\corridorkey2-workbench`. Close the running app and engine first: they lock the folder.
 - [ ] A hands-on check of projects in the real app (Open, Recent, a moved folder, held jobs), then merge `phase-3-4` into `main`.
 - [ ] Try the mask tool by hand on real footage: several keep/remove clicks, a box, Undo, a hint drawn while a render is running (CPU).
+- [ ] Re-check the clear bottle clip (`C0061.MP4_720p_colored.mov`) with a hint in the new Composite view. Lowering hint
+      Strength to about 0.5–0.75 may keep the inside see-through; that is untested.
+
+**Keying notes from real footage (clear bottle on green, 4 GB card)**
+- Flicker comes from the matte: clear plastic plus a small temporal window (Auto gives 4/2 at 720p on 4 GB, 24/12 on
+  8 GB, 80/40 on 16 GB). A hint reduces it. A bigger GPU should help too, which is one reason for Phase 5.
+- A solid SAM mask tells the model the whole bottle is subject, so alpha inside goes to about 1 and the green behind it
+  stays in `fg`. Despill turns that green neutral, but it doesn't make the bottle see-through. That depends on the matte.
 
 **Rules for this machine**
 - C: is nearly full. Point TMP, TEMP and HF_HOME at `D:\CODE\_tmp`.
@@ -198,9 +210,23 @@ Read this first when picking the work back up.
 - [ ] Keep each frame's points in the project, so they survive closing the app (today they're kept only while
       it runs).
 
-### Phase 5: LAN hosting
-- [ ] Settings toggle: engine binds 0.0.0.0 (token already required)
-- [ ] Connect to a remote engine; chunked clip upload; output download
+### Phase 5: LAN hosting (planned, version 0.6.0)
+Design, findings and open questions: "Phase 5 plan" in `PLAN.md`. Start after `phase-3-4` is merged to `main`, on a
+new branch `phase-5` from `main`. Each step below can be tested and committed alone.
+- [ ] 5.0 Get answers to the open questions in `PLAN.md` (shared storage first: it could change 5.4 and 5.5).
+- [ ] 5.1 Client engine target, local or remote. Only local can start or stop an engine. A dropped remote link retries
+      the same host. Local behaviour unchanged.
+- [ ] 5.2 Auth: LAN token and role, `api` number in `/health`, slim `/health`, no `?token=` for LAN, 401 for a
+      non-ASCII token.
+- [ ] 5.3 Host mode: "Share this PC's engine" in Settings, fixed port, no idle exit, a line to paste, firewall note.
+      "Connect to a host" on the client, with a host label on the VRAM bar.
+- [ ] 5.4 Path boundary and uploads: `upload:<id>` inputs, host-chosen `output_dir`, resumable `PUT`, disk margin, a
+      test that every endpoint refuses raw paths for the LAN role.
+- [ ] 5.5 Outputs: file list and Range download into `renders/<clip>/render_NNN`, resume on relaunch, confirm, clean-up.
+      Uploading and Downloading states in the queue row.
+- [ ] 5.6 Sharing: `owner` on jobs, paths removed from specs sent to LAN apps, no writes into another PC's project.
+- [ ] 5.7 Masks on a remote engine, one owner at a time. Until then the tool says it's unavailable.
+- [ ] 5.8 Check from a second PC: connect, render, download, close the app mid-render, reopen.
 
 ### Later: more export and colour
 - [ ] ProRes / DNxHR for every output (upstream always writes .mp4, so this needs a re-wrap or our own writer)
@@ -209,6 +235,8 @@ Read this first when picking the work back up.
       extracting frames) and check how OpenCV decodes untagged and BT.709 footage. Expose upstream's
       `--linear_brightness`, `--linear_contrast` and `--linear_contrast_pivot`.
 - [ ] OCIO / ACES input and output transforms (upstream has none; MarcelineVPQ/corridorkey-desktop ships OCIO 2.5)
+- [ ] Log footage: upstream treats video as display-coded and doesn't convert S-Log, V-Log or LogC. Warn on import, and
+      maybe offer a technical LUT to Rec.709 before keying.
 
 ## Backlog
 - [ ] Cutout view with real alpha (OpenCV can't read ProRes 4444 alpha; decode through ffmpeg)

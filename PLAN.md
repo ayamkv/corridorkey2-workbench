@@ -223,6 +223,83 @@ Decisions made:
 - **Version 0.5.0**, so an idle 0.4.0 engine (without the release-on-disconnect) is replaced. Holding jobs needs
   an engine of at least 0.4.0, compared by version number.
 
+## Phase 5 plan: LAN hosting (drafted 2026-11-06, not started)
+
+**Goal.** Someone on a small GPU (this laptop has 4 GB) keeps working in the app while a bigger PC on the same network
+does the render. Larger temporal windows on the host also mean less flicker. Nothing changes for local use.
+
+**The main idea: a remote render ends up exactly like a local one on disk.** The app uploads the clip and hint, the host
+renders into its own workspace, and the app downloads the outputs into `<project>\renders\<clip>\render_NNN\`. After
+that the viewer, `project.json` and `_reroot` work unchanged, because they only ever see local files.
+
+**What the code does today** (checked on 2026-11-06 against the 0.5.0 engine). `--lan` binds `0.0.0.0`, but that is
+all it does:
+
+| Finding | Why it matters on a LAN |
+|---|---|
+| `start_engine` stops an engine of another version, using the pid from `/health`, with a local `taskkill` | **A remote host's pid would kill an unrelated process on the client.** This must be impossible by design, not by a check |
+| `_sse_closed` reconnects through `start_engine`, which starts a local engine | A dropped link would silently switch the app to the local engine |
+| The token is new on every engine start | A remote app can't keep it |
+| `_free_port` moves to the next port if 8765 is taken | A remote app can't find the host |
+| The engine exits after 10 idle minutes | The host disappears, and nothing remote can start it |
+| `output_dir` accepts any path; `C:\Windows\...` passes `validate()` | Anyone with the token can write anywhere the host user can |
+| `/mask/predict` takes `image` and `out` paths | Same, and the paths are on the client, so masks fail remotely anyway |
+| `input` and `/system?path=` answer for any path | Anyone with the token can probe the host's disk |
+| `/health` returns `pid`, `ck_root` and `ck_python` | Host details that a remote app doesn't need |
+| `JobSpec.from_dict` drops unknown fields silently | A newer app on an older host loses settings with no error. Hold had the same problem |
+| A non-ASCII token returns 500, not 401 (`compare_digest` on `str`) | Small, but any stranger on the network can trigger it |
+| `?token=` is accepted | Tokens end up in URLs and logs |
+| `MaskService` is one worker with one embedding, and any app's `/mask/stop` stops it | Two apps would fight over it |
+| Finished jobs are written into `spec.project` if that file exists | A path from another PC can match a local file |
+
+Already fine: `FileResponse` serves Range requests (206 checked, Starlette 1.9) and `Request.stream()` takes raw PUT
+bodies, so uploads and resumable downloads need **no new dependency** (`python-multipart` isn't installed and isn't
+needed). `/events`, the queue and the VRAM poll work over any host.
+
+**Decisions**
+- **Two tokens, and the token sets the role, not the IP.** The local token stays random per start and keeps full path
+  access. The LAN token is stable, stored in the state folder, can be regenerated, and only ever reaches workspace
+  files. Because the role doesn't depend on the address, the whole remote path can be tested on one PC over 127.0.0.1.
+- **The LAN role never sends or receives a host path.** `input` and `hint_path` are `upload:<id>`, `output_dir` is
+  chosen by the host (`<workspace>\jobs\<job id>\`), and `/system` ignores `path`. Job specs sent to LAN apps have
+  paths removed. `/health` keeps only what a LAN app needs. `?token=` is refused for this role.
+- **The client gets an engine target: local or remote.** Only the local one can start or stop an engine, and the remote
+  one holds no pid at all. A dropped remote link retries the same host and says so; it never falls back to local.
+- **A separate `api` number in `/health`, not the app version.** A mismatch refuses with a clear message. The host
+  isn't replaced, because it may be running someone else's render.
+- **Host mode:** Settings has "Share this PC's engine". It uses a fixed port (a taken port is an error, not a silent
+  move), turns off idle exit, and shows one line to paste into the other app: host, port and token. The first bind
+  triggers the Windows Firewall prompt, and the Settings page says what to allow. No auto-discovery at first.
+- **Uploads:** `PUT /uploads/{id}/files/{name}?offset=N`, raw chunks, resumable. Names are checked (no separators) and
+  stored under the upload's own folder with a plain ASCII name, which also avoids non-ASCII problems in upstream's
+  readers. A sequence is one upload with many files. The whole clip goes up, even for a short range, because frame
+  numbering depends on the full source. Uploading only the range can come later.
+- **Reuse:** an upload is keyed by client id, path, size and mtime, so a second render of the same clip sends nothing.
+  No hashing pass delays the start. Size is checked at the end.
+- **Host disk is guarded.** An upload is refused (507) if it would leave less than a set margin free. Both disks here are
+  tight, so this is a real case. The workspace folder is a host setting.
+- **Clean-up:** a job's outputs go once the app confirms the download, or after 7 days. An upload goes 7 days after the
+  last job that used it.
+- **The render doesn't need the app; the transfers do.** Closing the app during a render is fine as it is today, and
+  downloads resume on the next launch. Uploading and downloading are client states shown in the queue row.
+- **One queue, shared.** Everyone sees every render and can cancel it (small trusted team). An `owner` client id on the
+  job decides who records it, so a job is only written into a project by the app that sent it.
+- **Masks come last.** The first release turns the tool off on a remote engine with a clear message, and a hint is still
+  uploaded as a file. Then `/mask` gets upload and download forms (a frame is a few MB, a mask much less), with one
+  owner at a time, so a second app gets "the mask tool is in use" rather than a stopped worker.
+
+**Open questions for the user** (each has a default, so work isn't blocked)
+1. **Is there shared storage (a NAS, or a share both PCs can see)?** If so, path mapping could skip most of the
+   copying, which matters for big EXR sequences. Default: upload and download, which work everywhere.
+2. **Is the network trusted?** Plain HTTP means footage and the token travel unencrypted. Default: trusted office LAN,
+   with a warning in Settings. TLS would be a separate step.
+3. **How many apps per host?** Default: a few, sharing one queue.
+4. **Is there a second PC for the final check?** Default: everything but the firewall is tested on one PC first.
+
+**Testing.** Unit tests for the path boundary (every endpoint, using the LAN token). A fake-remote run on one PC: two
+`CK2WB_STATE` folders, LAN token, and a test proving no client path reaches the host. Interrupted upload and download.
+A wrong `api` number. A host that restarts mid-job. Then one real run from a second PC.
+
 ## Verification
 - Phase 1: the CLI smoke test writes `_alpha.mp4` and `_fg.mp4`. `nvidia-smi` shows peak VRAM under 4 GB.
 - Phase 2:
