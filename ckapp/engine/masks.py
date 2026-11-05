@@ -146,6 +146,24 @@ class MaskService:
             raise MaskError(r.get("error", "mask request failed"))
         return r
 
+    RELEASE_AFTER = 30.0           # seconds with no app connected before the model's GPU memory is freed
+    _alone_since: Optional[float] = None
+
+    def idle_check(self, clients: int, now: float) -> bool:
+        """Call every few seconds with the number of connected apps. The model is only useful while an app is
+        connected, and an app that is closing can't be relied on to ask for /mask/stop, so the worker stops once
+        no app has been connected for RELEASE_AFTER seconds. True when it stopped it."""
+        if clients:
+            self._alone_since = None
+            return False
+        if self._alone_since is None:
+            self._alone_since = now
+            return False
+        if now - self._alone_since >= self.RELEASE_AFTER and self._alive():
+            self.stop()
+            return True
+        return False
+
     def stop(self) -> None:
         with self._lock:
             p, self._proc = self._proc, None

@@ -286,6 +286,22 @@ def test_before_run_hook_runs_before_each_render(clip, tmp_path):
         q.shutdown()
 
 
+def test_unicode_imread_opens_non_ascii_paths_and_keeps_missing_files_missing(tmp_path):
+    import cv2
+    import numpy as np
+    from ckapp.engine.ck_run import unicode_imread
+    d = tmp_path / "tést \U0001F600"
+    d.mkdir()
+    p = str(d / "hint.png")
+    ok, buf = cv2.imencode(".png", np.full((6, 9), 200, np.uint8))
+    buf.tofile(p)
+    imread = unicode_imread(cv2.imread)
+    img = imread(p, cv2.IMREAD_UNCHANGED)
+    assert img.shape == (6, 9) and img[0, 0] == 200
+    assert imread(p).shape == (6, 9, 3)                              # default flags: colour, like cv2.imread
+    assert imread(str(d / "nope.png"), cv2.IMREAD_UNCHANGED) is None
+
+
 # ------------------------------------------------------------------------- click to mask
 FAKE_SAM = str(Path(__file__).with_name("fake_sam_worker.py"))
 
@@ -327,6 +343,26 @@ def test_mask_service_download_open_predict_and_device(tmp_path):
         with pytest.raises(MaskError, match="not found"):
             m.open(str(tmp_path / "nope.png"))
         assert any(k == "mask" for k, _ in events)
+    finally:
+        m.stop()
+
+
+def test_mask_worker_is_freed_once_no_app_is_connected(tmp_path):
+    from ckapp.engine.masks import MaskService
+    m = MaskService(ck_python=sys.executable, cache_dir=str(tmp_path / "cache"), gpu_busy=lambda: False,
+                    worker_cmd=[sys.executable, FAKE_SAM])
+    try:
+        m.download()
+        assert wait_for(lambda: m.status()["model"])
+        m.open(_frame(tmp_path))
+        assert m.status()["running"]
+        t = 1000.0
+        assert not m.idle_check(1, t)                            # an app is connected: keep it
+        assert not m.idle_check(0, t + 5)                        # the app just went (or is reconnecting)
+        assert not m.idle_check(1, t + 10) and not m.idle_check(0, t + 12)   # it came back: the clock restarts
+        assert not m.idle_check(0, t + 12 + m.RELEASE_AFTER - 1) and m.status()["running"]
+        assert m.idle_check(0, t + 12 + m.RELEASE_AFTER) and not m.status()["running"]
+        assert not m.idle_check(0, t + 100)                      # nothing left to stop
     finally:
         m.stop()
 

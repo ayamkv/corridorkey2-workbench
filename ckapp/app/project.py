@@ -110,6 +110,7 @@ class Project:
             for r in clip.renders:
                 r.out_dir = _abs(r.out_dir, self.root)
                 r.outputs = {k: _abs(v, self.root) for k, v in r.outputs.items()}
+            clip.settings.hint_path = _abs(clip.settings.hint_path, self.root)
             clip.base = self.root
             if not clip.folder:
                 self.assign_folder(clip)
@@ -120,6 +121,7 @@ class Project:
         for c in self.clips:
             d = {k: getattr(c, k) for k in Clip.SAVED}
             d["settings"] = asdict(c.settings)
+            d["settings"]["hint_path"] = _rel(c.settings.hint_path, self.root)     # drawn masks live in the project
             d["renders"] = []
             for r in c.renders:
                 rd = asdict(r)

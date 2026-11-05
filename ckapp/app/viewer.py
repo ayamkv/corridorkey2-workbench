@@ -42,12 +42,24 @@ uniform vec2 uCenter;         // image coords (top-left origin) shown at the vie
 uniform float uZoom;          // framebuffer pixels per image pixel
 uniform float uCheck;         // checker size in framebuffer pixels
 uniform vec3 uBg;
+uniform float uDespill;       // composite only: CorridorKey's average despill, 0..1
+uniform sampler2D uMask;      // click-to-mask result, 1 = keep
+uniform bool uMaskOn;
+uniform vec3 uTint;
 
 vec3 srgbEncode(vec3 x) {
     x = max(x, vec3(0.0));
     vec3 lo = x * 12.92;
     vec3 hi = 1.055 * pow(x, vec3(1.0 / 2.4)) - 0.055;
     return mix(lo, hi, step(vec3(0.0031308), x));
+}
+// corridorkey/runtime.py _despill_average_srgb_torch: green above the red/blue average moves into red and blue.
+// Upstream applies it to sRGB foregrounds (video) and to linear ones (EXR); here it runs before the sRGB encode,
+// so it matches both.
+vec3 despill(vec3 c, float s) {
+    float spill = max(c.g - (c.r + c.b) * 0.5, 0.0);
+    vec3 full = vec3(c.r + spill * 0.5, c.g - spill, c.b + spill * 0.5);
+    return mix(c, full, clamp(s, 0.0, 1.0));
 }
 vec3 checker(vec2 p) {
     vec2 c = floor(p / uCheck);
@@ -63,6 +75,7 @@ void main() {
         return;
     }
     vec3 c = texture(uColor, uv).rgb;
+    if (uMode == 1 && uDespill > 0.0) c = despill(c, uDespill);
     if (uColorLinear) c = srgbEncode(c);
     if (uMode == 2) {
         outColor = vec4(vec3(clamp(c.r, 0.0, 1.0)), 1.0);
@@ -71,6 +84,18 @@ void main() {
         outColor = vec4(mix(checker(q), clamp(c, 0.0, 1.0), a), 1.0);
     } else {
         outColor = vec4(clamp(c, 0.0, 1.0), 1.0);
+    }
+    if (uMaskOn) {
+        // tint what's kept, dim the rest a little, and outline the edge about 1.5 screen pixels wide
+        float m = texture(uMask, uv).r;
+        vec2 d = vec2(1.5 / uZoom) / uImgSize;
+        float lo = min(min(texture(uMask, uv + vec2(d.x, 0.0)).r, texture(uMask, uv - vec2(d.x, 0.0)).r),
+                       min(texture(uMask, uv + vec2(0.0, d.y)).r, texture(uMask, uv - vec2(0.0, d.y)).r));
+        float hi = max(max(texture(uMask, uv + vec2(d.x, 0.0)).r, texture(uMask, uv - vec2(d.x, 0.0)).r),
+                       max(texture(uMask, uv + vec2(0.0, d.y)).r, texture(uMask, uv - vec2(0.0, d.y)).r));
+        vec3 rgb = mix(outColor.rgb * 0.55, mix(outColor.rgb, uTint, 0.35), m);
+        float edge = step(0.5, hi) * (1.0 - step(0.5, lo));
+        outColor = vec4(mix(rgb, uTint, edge), 1.0);
     }
 }
 """
@@ -92,6 +117,7 @@ class Side:
     color: Optional[Frame] = None
     alpha: Optional[Frame] = None
     note: str = ""                   # shown when there is nothing to draw
+    despill: float = 0.0             # composite: despill the foreground, as the checker and cutout outputs are
 
 
 class _Tex:
@@ -104,8 +130,10 @@ class _Tex:
                      (GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE), (GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)):
             GL.glTexParameteri(GL.GL_TEXTURE_2D, p, v)
 
-    def upload(self, fr: Frame) -> None:
-        if self.key is not None and self.key == id(fr):
+    def upload(self, fr: Frame, key=None) -> None:
+        """`key` names the content; by default the Frame object (fine while frames live in the cache)."""
+        key = id(fr) if key is None else key
+        if self.key is not None and self.key == key:
             return
         a = fr.data
         h, w, c = a.shape
@@ -124,7 +152,7 @@ class _Tex:
             sw = GL.GL_RED if c == 1 else None
             GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_SWIZZLE_G, sw or GL.GL_GREEN)
             GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_SWIZZLE_B, sw or GL.GL_BLUE)
-        self.key = id(fr)
+        self.key = key
 
     def set_nearest(self, on: bool) -> None:
         GL.glBindTexture(GL.GL_TEXTURE_2D, self.id)
@@ -134,8 +162,11 @@ class _Tex:
 class GLViewer(QOpenGLWidget):
     viewChanged = Signal()
     glFailed = Signal(str)
+    maskClicked = Signal(float, float, bool)            # image x, y; True = keep, False = remove
+    maskBoxed = Signal(float, float, float, float)      # image x0, y0, x1, y1 (any order)
 
     SINGLE, WIPE, SIDE = "single", "wipe", "side"
+    DRAG_PX = 4                                         # a press that moves less than this is a click
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -153,8 +184,27 @@ class GLViewer(QOpenGLWidget):
         self._prog = None
         self._tex: dict[str, _Tex] = {}
         self._ok = True
+        # click to mask: the tool, the mask shown over side A (single layout), and the prompts drawn on top
+        self.mask_tool = False
+        self.mask: Optional[Frame] = None
+        self.mask_key = 0
+        self.mask_points: list = []
+        self.mask_box: Optional[list] = None
+        self._box_drag: Optional[tuple[QPointF, QPointF]] = None
 
     # -- content ---------------------------------------------------------------------------
+    def set_mask_tool(self, on: bool) -> None:
+        self.mask_tool = on
+        self._drag = self._box_drag = None
+        self.setCursor(Qt.CrossCursor if on else Qt.ArrowCursor)
+        self.update()
+
+    def set_mask(self, mask: Optional[Frame], key: int = 0, points: Optional[list] = None,
+                 box: Optional[list] = None) -> None:
+        """The mask (HxWx1 uint8, 255 = keep) and its prompts; `key` changes whenever the mask does."""
+        self.mask, self.mask_key = mask, key
+        self.mask_points, self.mask_box = list(points or []), box
+        self.update()
     def set_sides(self, a: Side, b: Side) -> None:
         self.a, self.b = a, b
         for s in (a, b):
@@ -201,8 +251,8 @@ class GLViewer(QOpenGLWidget):
             self._vao = GL.glGenVertexArrays(1)
             self._u = {n: GL.glGetUniformLocation(prog, n) for n in (
                 "uColor", "uAlpha", "uMode", "uColorLinear", "uViewport", "uImgSize", "uCenter",
-                "uZoom", "uCheck", "uBg")}
-            self._tex = {k: _Tex() for k in ("a_color", "a_alpha", "b_color", "b_alpha")}
+                "uZoom", "uCheck", "uBg", "uMask", "uMaskOn", "uTint", "uDespill")}
+            self._tex = {k: _Tex() for k in ("a_color", "a_alpha", "b_color", "b_alpha", "mask")}
         except Exception as e:  # no GL 3.3: report and draw nothing
             self._ok = False
             self.glFailed.emit(str(e))
@@ -247,6 +297,9 @@ class GLViewer(QOpenGLWidget):
             GL.glBindVertexArray(self._vao)
             GL.glUniform1i(self._u["uColor"], 0)
             GL.glUniform1i(self._u["uAlpha"], 1)
+            GL.glUniform1i(self._u["uMask"], 2)
+            tint = QColor(T.c("ACCENT"))
+            GL.glUniform3f(self._u["uTint"], tint.redF(), tint.greenF(), tint.blueF())
             GL.glUniform3f(self._u["uBg"], bg.redF(), bg.greenF(), bg.blueF())
             GL.glUniform1f(self._u["uCheck"], 12.0 * self.devicePixelRatioF())
             vps = self._viewports()
@@ -268,7 +321,7 @@ class GLViewer(QOpenGLWidget):
             GL.glUseProgram(0)
             # Give QPainter back the state it expects. Its glyph cache uploads text with the
             # default 4-byte unpack alignment; leaving ours at 1 garbles letters in the overlay.
-            for unit in (GL.GL_TEXTURE1, GL.GL_TEXTURE0):
+            for unit in (GL.GL_TEXTURE2, GL.GL_TEXTURE1, GL.GL_TEXTURE0):     # ends with unit 0 active
                 GL.glActiveTexture(unit)
                 GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
             GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 4)
@@ -287,6 +340,16 @@ class GLViewer(QOpenGLWidget):
         GL.glUniform2f(self._u["uCenter"], cx, cy)
         GL.glUniform1f(self._u["uZoom"], z)
         GL.glUniform1i(self._u["uMode"], mode)
+        GL.glUniform1f(self._u["uDespill"], side.despill if mode == MODE_COMPOSITE else 0.0)
+        mask_on = (slot == "a" and self.layout_mode == self.SINGLE and self.mask is not None
+                   and side.color is not None and self.mask.size == side.color.size)
+        GL.glUniform1i(self._u["uMaskOn"], int(mask_on))
+        if mask_on:
+            tm = self._tex["mask"]
+            GL.glActiveTexture(GL.GL_TEXTURE2)
+            tm.upload(self.mask, key=self.mask_key)
+            tm.set_nearest(z >= 2.0)
+            GL.glActiveTexture(GL.GL_TEXTURE0)
         if mode != MODE_EMPTY:
             t = self._tex[f"{slot}_color"]
             GL.glActiveTexture(GL.GL_TEXTURE0)
@@ -345,11 +408,44 @@ class GLViewer(QOpenGLWidget):
         else:
             note(QRectF(0, 0, w, h), self.a)
             tag(10, 10, self.a.label)
+            self._mask_overlay(p)
         if not self._ok:
             p.setPen(QColor(T.c("ERROR")))
             p.drawText(self.rect(), Qt.AlignCenter, "OpenGL 3.3 is not available - the viewer is disabled")
 
+    def _mask_overlay(self, p: QPainter) -> None:
+        """Keep (green) and remove (red) dots, the box, and the box being dragged."""
+        if not (self.mask_tool or self.mask_points or self.mask_box):
+            return
+        accent = QColor(T.c("ACCENT"))
+        for box, dashed in ((self.mask_box, False),
+                            ((self._box_drag[0].x(), self._box_drag[0].y(), self._box_drag[1].x(),
+                              self._box_drag[1].y()) if self._box_drag else None, True)):
+            if not box:
+                continue
+            r = QRectF(self.widget_at(QPointF(box[0], box[1])), self.widget_at(QPointF(box[2], box[3]))).normalized()
+            pen = QPen(accent, 1.5, Qt.DashLine if dashed else Qt.SolidLine)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(r)
+        for x, y, keep in self.mask_points:
+            c = self.widget_at(QPointF(x, y))
+            p.setPen(QPen(QColor(0, 0, 0, 200), 2))
+            p.setBrush(QColor(T.c("OK" if keep else "ERROR")))
+            p.drawEllipse(c, 5.5, 5.5)
+            p.setPen(QPen(QColor(255, 255, 255, 230), 1.6))
+            p.drawLine(QPointF(c.x() - 2.5, c.y()), QPointF(c.x() + 2.5, c.y()))
+            if keep:
+                p.drawLine(QPointF(c.x(), c.y() - 2.5), QPointF(c.x(), c.y() + 2.5))
+
     # -- interaction -------------------------------------------------------------------------
+    def widget_at(self, img: QPointF) -> QPointF:
+        """Image pixel -> widget position (single / wipe layout); the inverse of _img_at."""
+        dpr = self.devicePixelRatioF()
+        vp = self._viewports()[0]
+        z, cx, cy = self._view_for(vp)
+        return QPointF(((img.x() - cx) * z + vp[2] / 2 + vp[0]) / dpr, ((img.y() - cy) * z + vp[3] / 2) / dpr)
+
     def _img_at(self, pos: QPointF, vp_index: int = 0) -> QPointF:
         dpr = self.devicePixelRatioF()
         vp = self._viewports()[vp_index]
@@ -383,6 +479,10 @@ class GLViewer(QOpenGLWidget):
 
     def mousePressEvent(self, e) -> None:
         pos = e.position()
+        if self.mask_tool and e.button() in (Qt.LeftButton, Qt.RightButton):
+            self._drag = ("mask", pos, e.button())          # click (point) or, for left, a drag (box)
+            e.accept()
+            return
         if self.layout_mode == self.WIPE and e.button() == Qt.LeftButton and abs(pos.x() - self.width() * self.wipe) < 12:
             self._drag = ("wipe", pos)
         elif e.button() in (Qt.LeftButton, Qt.MiddleButton):
@@ -392,6 +492,13 @@ class GLViewer(QOpenGLWidget):
 
     def mouseMoveEvent(self, e) -> None:
         pos = e.position()
+        if self._drag and self._drag[0] == "mask":
+            start, button = self._drag[1], self._drag[2]
+            moved = (pos - start).manhattanLength() >= self.DRAG_PX
+            if button == Qt.LeftButton and (moved or self._box_drag):
+                self._box_drag = (self._img_at(start), self._img_at(pos))
+                self.update()
+            return
         if self._drag and self._drag[0] == "wipe":
             self.wipe = float(np.clip(pos.x() / max(1, self.width()), 0.0, 1.0))
             self.update()
@@ -405,11 +512,27 @@ class GLViewer(QOpenGLWidget):
             self.setCursor(Qt.SplitHCursor if near else Qt.ArrowCursor)
 
     def mouseReleaseEvent(self, e) -> None:
+        if self._drag and self._drag[0] == "mask":
+            start, button = self._drag[1], self._drag[2]
+            if e.button() != button:
+                return
+            box, self._box_drag, self._drag = self._box_drag, None, None
+            if box is not None:
+                self.maskBoxed.emit(box[0].x(), box[0].y(), box[1].x(), box[1].y())
+            else:
+                img = self._img_at(start)
+                if 0 <= img.x() < self.img_size[0] and 0 <= img.y() < self.img_size[1]:
+                    self.maskClicked.emit(img.x(), img.y(), button == Qt.LeftButton)
+            self.update()
+            return
         if self._drag and self._drag[0] == "pan":
             self.viewChanged.emit()
         self._drag = None
 
     def mouseDoubleClickEvent(self, e) -> None:
+        if self.mask_tool:                  # quick clicks are two points, not "fit"
+            self.mousePressEvent(e)
+            return
         self.fit_view()
 
     def grab_rgb(self) -> np.ndarray:

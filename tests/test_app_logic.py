@@ -116,6 +116,99 @@ def test_project_paths_are_relative_so_it_can_move(tmp_path):
     assert moved.clips[0].render_root() == os.path.join(str(tmp_path / "b"), "renders", "plate")
 
 
+def test_drawn_hint_path_is_relative_so_it_moves_with_the_project(tmp_path):
+    p = Project.create(tmp_path / "a")
+    c = Clip(str(tmp_path / "plate.mp4"), "video", 10, 24, 64, 64)
+    p.add(c)
+    c.settings.hint_mode, c.settings.hint_frame = "first", 4
+    c.settings.hint_path = os.path.join(c.masks_dir(), "hint_f000004.png")
+    p.save()
+    raw = json.loads((tmp_path / "a" / "project.json").read_text(encoding="utf-8"))
+    assert raw["clips"][0]["settings"]["hint_path"] == "masks/plate/hint_f000004.png"
+    os.rename(tmp_path / "a", tmp_path / "b")
+    s = Project.open(tmp_path / "b").clips[0].settings
+    assert s.hint_path == os.path.join(str(tmp_path / "b"), "masks", "plate", "hint_f000004.png")
+    assert s.hint_frame == 4
+
+
+@pytest.mark.parametrize("mode,fin,fout,frame,expect", [
+    ("all", 0, -1, 40, (40, 99)),            # entire clip: from the hint frame to the end
+    ("custom", 10, 60, 40, (40, 60)),        # out-point still after it: kept
+    ("custom", 10, 30, 40, (40, 99)),        # out-point before it: runs to the end, never a 1-frame render
+    ("custom", 10, 60, 60, (60, 60)),
+    ("custom", 10, 60, 500, (99, 99))])
+def test_hint_range_puts_the_in_point_on_the_hint_frame(mode, fin, fout, frame, expect):
+    assert make_clip(range_mode=mode, frame_in=fin, frame_out=fout).hint_range(frame) == expect
+
+
+def test_hint_mismatch_only_for_drawn_first_frame_hints():
+    c = make_clip(range_mode="custom", frame_in=12, frame_out=50, hint_mode="first", hint_path="h.png",
+                  hint_frame=20)
+    assert c.hint_mismatch() == 20
+    c.settings.frame_in = 20
+    assert c.hint_mismatch() is None
+    c.settings.frame_in, c.settings.hint_frame = 12, -1          # chosen file: frame unknown
+    assert c.hint_mismatch() is None
+    c.settings.hint_frame, c.settings.hint_mode = 20, "video"
+    assert c.hint_mismatch() is None
+
+
+# ------------------------------------------------------------------------- click to mask
+def _session():
+    from ckapp.app.masking import MaskSession
+    return MaskSession("c1", 7, 160, 90, "img.png", "out.png")
+
+
+def test_mask_session_edits_and_undo():
+    s = _session()
+    assert s.empty() and not s.stale() and not s.fresh()
+    assert not s.add_point(200, 10, True) and not s.add_point(-1, 10, True)     # outside the image
+    assert s.add_point(10, 20, True) and s.add_point(30, 40, False)
+    assert s.points == [[10, 20, 1], [30, 40, 0]] and s.stale() and s.summary() == "1 keep, 1 remove"
+    assert s.set_box(150, 80, -20, 5)                                         # any corner order, clamped
+    assert s.box == [0, 5, 150, 80]
+    assert not s.set_box(10, 10, 11, 50)                                      # too thin: a slip, not a box
+    assert s.set_box(20, 20, 60, 60) and s.undo() and s.box == [0, 5, 150, 80]   # undo restores the old box
+    assert s.clear() and s.empty() and s.mask is None and not s.stale()
+    assert s.undo() and s.points and s.box                                    # Clear can be undone
+    while s.undo():
+        pass
+    assert s.empty() and s.mask is None
+
+
+def test_mask_session_keeps_only_masks_for_its_latest_edit():
+    s = _session()
+    s.add_point(10, 20, True)
+    gen = s.gen
+    m = np.zeros((90, 160), np.uint8)
+    assert not s.set_mask(gen, np.zeros((10, 10), np.uint8), 0.9)             # wrong size
+    s.add_point(50, 50, True)                                                 # edited while the request was out
+    assert not s.set_mask(gen, m, 0.9) and s.mask is None
+    assert s.set_mask(s.gen, m, 0.9) and s.fresh()
+    key = s.mask_key
+    assert s.mask_frame().data.shape == (90, 160, 1)
+    s.add_point(60, 60, True)
+    assert s.stale() and not s.fresh() and s.mask is not None                # old mask stays on screen meanwhile
+    assert s.set_mask(s.gen, m.copy(), 0.8) and s.mask_key != key             # new mask, new texture key
+
+
+def test_hint_file_never_overwrites(tmp_path):
+    from ckapp.app.masking import hint_file
+    first = hint_file(str(tmp_path), 12)
+    assert os.path.basename(first) == "hint_f000012.png"
+    open(first, "wb").close()
+    assert os.path.basename(hint_file(str(tmp_path), 12)) == "hint_f000012_2.png"
+
+
+def test_display_u8_encodes_linear_to_srgb():
+    from ckapp.app.media import Frame, display_u8
+    lin = Frame(np.full((2, 2, 3), 0.18, np.float16), linear=True)
+    assert abs(int(display_u8(lin)[0, 0, 0]) - 118) <= 1                     # 18% grey is about 118 in sRGB
+    assert display_u8(Frame(np.full((2, 2, 3), 0.5, np.float16)))[0, 0, 0] == 128
+    u8 = np.full((2, 2, 3), 7, np.uint8)
+    assert display_u8(Frame(u8)) is u8
+
+
 def test_clip_folders_are_unique(tmp_path):
     p = Project.create(tmp_path / "p")
     a = Clip(str(tmp_path / "one" / "plate.mp4"), "video", 10, 24, 64, 64)

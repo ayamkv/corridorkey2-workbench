@@ -59,14 +59,37 @@ def _clamp_range(total: int, frame_in: int | None, frame_out: int | None) -> tup
     return first, last
 
 
+def unicode_imread(orig):
+    """cv2.imread can't open non-ASCII paths on Windows (a clip folder like "tést" or an emoji name), and upstream
+    reads hint images and frame folders with it. Fall back to bytes + imdecode only when the original fails, so
+    ASCII paths behave exactly as before."""
+    def imread(path, flags=None, *rest):
+        img = orig(path, *(() if flags is None else (flags,)), *rest)
+        if img is not None:
+            return img
+        import numpy as np
+        try:
+            buf = np.fromfile(str(path), np.uint8)
+        except OSError:
+            return None                              # really missing: same answer as cv2.imread
+        import cv2
+        return cv2.imdecode(buf, cv2.IMREAD_COLOR if flags is None else flags)
+    imread.ck_unicode = True
+    return imread
+
+
 def install_hooks(frame_in: int | None, frame_out: int | None) -> None:
     """Patch the runtime for the next run_inference().
 
     Always: the first output writer prints ``[ck] written k/T`` per batch, because
-    upstream is silent while stage 2 writes frames. With a range: the run covers
+    upstream is silent while stage 2 writes frames, and images (hints, frame folders) open from non-ASCII paths. With a range: the run covers
     ``[frame_in..frame_out]`` and EXR frames are numbered from ``frame_in``.
     """
+    import cv2
     from corridorkey import runtime, video_io
+
+    if not getattr(cv2.imread, "ck_unicode", False):
+        cv2.imread = unicode_imread(cv2.imread)
 
     orig_probe_video = runtime.probe_video_meta
     orig_probe_dir = runtime.probe_frame_dir_meta

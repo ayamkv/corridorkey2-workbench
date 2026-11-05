@@ -415,6 +415,233 @@ def test_moved_project_keeps_its_outputs_when_the_engine_reports_old_paths(win, 
                                                   "alpha": os.path.join(new_out, "plate_alpha.mp4")}
 
 
+def test_composite_view_previews_despill_live(win, clip_path, app):
+    from ckapp.app.model import Render
+    win.import_paths([clip_path])
+    r = Render("j", "out", 0, 119, "video", status="done", outputs={"fg": clip_path, "alpha": clip_path})
+    win.clip.renders.append(r)
+    win.render = r
+    win.cb_a.setCurrentIndex(win.cb_a.findData("composite"))
+    win.inspector.sl_despill._set(0.8, from_slider=True)          # the user drags Despill
+    app.processEvents()
+    a = win.viewer.a
+    assert a.despill == 0.8 and "despill 0.80" in a.label        # no re-render needed
+    assert win._side("a", "fg").despill == 0.0                  # Foreground stays the raw output
+
+
+def test_composite_despill_shader_matches_upstream(win, app):
+    """Draw a known spill colour through the real shader and compare with upstream's formula."""
+    import numpy as np
+    from ckapp.app.media import Frame
+    from ckapp.app.viewer import MODE_COMPOSITE, Side
+    v = win.viewer
+    app.processEvents()
+    if not (v._ok and v._prog):
+        pytest.skip("no OpenGL 3.3 here")
+    rgb = np.array([0.30, 0.70, 0.20])
+    color = Frame(np.ascontiguousarray(np.tile((rgb[::-1] * 255).round().astype(np.uint8), (64, 64, 1))))
+    alpha = Frame(np.full((64, 64, 1), 255, np.uint8))
+    v.set_sides(Side("c", MODE_COMPOSITE, color, alpha, despill=0.6), Side())
+    v.set_layout("single")
+    got = v.grab_rgb()[v.height() // 2, v.width() // 2] / 255.0
+    c = (rgb * 255).round() / 255
+    spill = max(c[1] - (c[0] + c[2]) / 2, 0)
+    full = np.array([c[0] + spill / 2, c[1] - spill, c[2] + spill / 2])
+    want = c * 0.4 + full * 0.6
+    assert np.abs(got - want).max() < 2.5 / 255, (got, want)
+
+
+# ------------------------------------------------------------------------- click to mask
+class FakeMaskEngine:
+    """Answers the client's mask calls at once: the 'mask' is a disc per keep-click, minus remove-clicks, or the
+    box. Checks that every request names a plate frame the app really wrote at clip size."""
+
+    def __init__(self, win, model=True, old=False, defer=False):
+        self.win, self.calls, self.defer, self.pending = win, [], defer, []
+        self.status = {"model": model, "downloading": False, "running": False, "device": None, "error": ""}
+        c = win.client
+        if old:                                                  # an engine from before masks
+            c.mask_status = lambda done, fail: fail("Not Found", 404)
+        else:
+            c.mask_status = lambda done, fail: done(dict(self.status))
+        c.mask_download = self.download
+        c.mask_open = self.open
+        c.mask_predict = self.predict
+        c.mask_stop = lambda: self.calls.append(("stop",))
+
+    def _emit(self):
+        self.win.client.maskStatus.emit(dict(self.status))
+
+    def download(self, done, fail):
+        self.calls.append(("download",))
+        self.status["model"] = True
+        done(dict(self.status))
+
+    def open(self, image, done, fail):
+        self.calls.append(("open", image))
+        if self.defer:                                           # still loading the model: answer later
+            self.pending.append(lambda: done({"ok": True, "width": 320, "height": 180, "device": "cuda"}))
+            return
+        self.status["running"] = True
+        self._emit()
+        done({"ok": True, "width": 320, "height": 180, "device": "cuda"})
+
+    def predict(self, image, points, box, out, done, fail):
+        import cv2
+        import numpy as np
+        from ckapp.app.media import write_png
+        assert cv2.imread(image).shape == (180, 320, 3)
+        self.calls.append(("predict", [list(p) for p in points], box))
+        m = np.zeros((180, 320), np.uint8)
+        if box:
+            x0, y0, x1, y1 = (int(v) for v in box)
+            m[y0:y1, x0:x1] = 255
+        for x, y, keep in points:
+            cv2.circle(m, (int(x), int(y)), 20, 255 if keep else 0, -1)
+        write_png(out, m)
+        self.status["running"] = True
+        self._emit()
+        done({"ok": True, "score": 0.9, "device": "cuda", "width": 320, "height": 180})
+
+
+def _settle(app, cond, timeout=10.0):
+    import time
+    end = time.time() + timeout
+    while not cond() and time.time() < end:
+        app.processEvents()
+        time.sleep(0.01)
+    return cond()
+
+
+def _click(viewer, x, y, button=None):
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtTest import QTest
+    QTest.mouseClick(viewer, button or Qt.LeftButton, Qt.NoModifier, viewer.widget_at(QPointF(x, y)).toPoint())
+
+
+def test_mask_tool_holds_single_plate_and_restores_the_layout(win, tmp_path, clip_path, app):
+    win.import_paths([clip_path])
+    win.masks.cache_dir = str(tmp_path / "cache")
+    fake = FakeMaskEngine(win)
+    win.seg_layout.set_current("wipe", emit=True)
+    win.cb_a.setCurrentIndex(win.cb_a.findData("composite"))
+    win.bt_mask.setChecked(True)
+    assert win.viewer.mask_tool and win.viewer.layout_mode == "single" and win.cb_a.currentData() == "plate"
+    assert not win.seg_layout.isEnabled() and not win.cb_a.isEnabled() and win.mask_bar.isVisible()
+    assert all(s.isEnabled() for s in win.mask_shortcuts)
+    win.mask_shortcuts[0].activated.emit()                         # Esc
+    assert not win.viewer.mask_tool and not win.bt_mask.isChecked() and not win.mask_bar.isVisible()
+    assert win.viewer.layout_mode == "wipe" and win.cb_a.currentData() == "composite" and win.seg_layout.isEnabled()
+    assert not any(s.isEnabled() for s in win.mask_shortcuts)
+    assert fake.calls[-1] == ("stop",)                             # the model's GPU memory is let go
+    win._select_clip(None)
+    win.bt_mask.setChecked(True)                                   # nothing to mask
+    assert not win.bt_mask.isChecked() and not win.viewer.mask_tool
+
+
+def test_mask_clicks_box_undo_and_use_as_hint(win, tmp_path, clip_path, app):
+    import cv2
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtTest import QTest
+    win.import_paths([clip_path])
+    win.masks.cache_dir = str(tmp_path / "cache")
+    fake = FakeMaskEngine(win)
+    win.set_frame(30)
+    win.bt_mask.setChecked(True)
+    s = win.masks.current
+    assert s is not None and s.frame == 30
+    assert _settle(app, lambda: ("open", s.image) in fake.calls)     # frame written, embedded before any click
+    v = win.viewer
+    _click(v, 160, 90)
+    assert s.points and abs(s.points[0][0] - 160) < 2 and abs(s.points[0][1] - 90) < 2 and s.points[0][2] == 1
+    assert s.fresh() and s.mask[90, 160] == 255 and v.mask is not None and v.mask_points == s.points
+    _click(v, 40, 40, Qt.RightButton)
+    assert s.points[-1][2] == 0 and fake.calls[-1][1][-1][2] == 0
+    a, b = v.widget_at(QPointF(200, 100)).toPoint(), v.widget_at(QPointF(300, 170)).toPoint()
+    QTest.mousePress(v, Qt.LeftButton, Qt.NoModifier, a)
+    QTest.mouseMove(v, b)
+    QTest.mouseRelease(v, Qt.LeftButton, Qt.NoModifier, b)
+    assert s.box and abs(s.box[0] - 200) < 2 and abs(s.box[3] - 170) < 2 and len(s.points) == 2   # a drag: no point
+    assert fake.calls[-1][2] == s.box
+    win.mask_shortcuts[1].activated.emit()                         # Ctrl+Z
+    assert s.box is None and len(s.points) == 2 and s.fresh()
+    assert "1 keep, 1 remove" in win.lb_mask.text() and win.bt_mask_use.isEnabled()
+
+    win.bt_mask_use.click()
+    st = win.clip.settings
+    hint = os.path.join(win.project.root, "masks", "plate", "hint_f000030.png")
+    assert (st.hint_mode, st.hint_path, st.hint_frame) == ("first", hint, 30)
+    assert cv2.imread(hint, cv2.IMREAD_UNCHANGED).shape == (180, 320)     # one channel, clip size
+    assert win.clip.frame_range() == (30, 119) and (win.timeline.ruler.rin, win.timeline.ruler.rout) == (30, 119)
+    assert "in-point moved from 0 to 30" in win.st_msg.text()
+    ins = win.inspector
+    assert ins.lb_hint_at.text().startswith("Drawn on frame 30") and not ins.hint_warn.isVisibleTo(ins)
+    spec = win.clip.to_spec("out")
+    assert (spec.hint_mode, spec.hint_path, spec.frame_in) == ("first", hint, 30)
+    win.bt_mask_use.click()                                        # again: a new file, the first is kept
+    assert win.clip.settings.hint_path.endswith("hint_f000030_2.png") and os.path.isfile(hint)
+
+    win.inspector.sp_in.setValue(10)                               # in-point moved off the hint's frame
+    assert ins.hint_warn.isVisibleTo(ins) and "drawn on frame 30" in ins.lb_hint_warn.text()
+    ins.bt_hint_frame.click()
+    assert win.clip.frame_range()[0] == 30 and not ins.hint_warn.isVisibleTo(ins)
+    win.bt_mask.setChecked(False)
+    assert ("stop",) in fake.calls
+
+
+def test_mask_edits_wait_for_the_model_download(win, tmp_path, clip_path, app):
+    win.import_paths([clip_path])
+    win.masks.cache_dir = str(tmp_path / "cache")
+    fake = FakeMaskEngine(win, model=False)
+    win.bt_mask.setChecked(True)
+    assert win.bt_mask_dl.isVisibleTo(win.mask_bar) and "isn't downloaded" in win.lb_mask.text()
+    s = win.masks.current
+    assert _settle(app, lambda: s.image_ready)
+    _click(win.viewer, 100, 60)
+    assert s.points and not any(c[0] == "predict" for c in fake.calls)    # nothing to ask yet
+    win.bt_mask_dl.click()
+    assert fake.calls[0] == ("download",) and s.fresh() and not win.bt_mask_dl.isVisibleTo(win.mask_bar)
+
+
+def test_leaving_while_the_model_loads_still_frees_it(win, tmp_path, clip_path, app):
+    win.import_paths([clip_path])
+    win.masks.cache_dir = str(tmp_path / "cache")
+    fake = FakeMaskEngine(win, defer=True)
+    win.bt_mask.setChecked(True)
+    assert _settle(app, lambda: fake.pending)                     # the first open is out: the model is loading
+    assert "Loading the mask model" in win.lb_mask.text()
+    win.mask_shortcuts[0].activated.emit()                         # Esc before it finished
+    assert fake.calls[-1] == ("stop",)
+    fake.calls.clear()
+    fake.pending.pop()()                                           # the load finishes after all
+    assert fake.calls == [("stop",)] and not win.masks.busy()      # ...and is let go again
+
+
+def test_old_mask_pngs_are_cleaned_from_the_cache(app, tmp_path):
+    import time
+    from ckapp.app.client import EngineClient
+    from ckapp.app.masking import MaskController
+    folder = tmp_path / "masks"
+    folder.mkdir()
+    old, new = folder / "c_f000001.png", folder / "c_f000002.png"
+    old.write_bytes(b"x")
+    new.write_bytes(b"x")
+    t = time.time() - 13 * 3600
+    os.utime(old, (t, t))
+    MaskController(EngineClient(), None, str(tmp_path))
+    assert not old.exists() and new.exists()
+
+
+def test_mask_tool_on_an_engine_without_masks(win, tmp_path, clip_path, app):
+    win.import_paths([clip_path])
+    win.masks.cache_dir = str(tmp_path / "cache")
+    fake = FakeMaskEngine(win, old=True)
+    win.bt_mask.setChecked(True)
+    _click(win.viewer, 100, 60)
+    assert "can't make masks" in win.lb_mask.text() and not any(c[0] == "predict" for c in fake.calls)
+    assert not win.bt_mask_use.isEnabled() and not win.bt_mask_dl.isVisibleTo(win.mask_bar)
+
+
 def test_renders_finished_while_closed_reach_their_own_project(win, tmp_path, clip_path, app):
     from ckapp.app.model import Render
     from ckapp.app.project import Project

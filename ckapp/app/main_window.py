@@ -18,7 +18,8 @@ from . import theme as T
 from .client import EngineClient
 from .frames import FrameProvider
 from .inspector import Inspector
-from .media import is_media, probe
+from .masking import MaskController, hint_file
+from .media import is_media, probe, write_png
 from ..engine.jobs import FINISHED, PENDING
 from .model import Clip, Render
 from .panels import MediaBin, QueuePanel, ThumbLoader
@@ -64,6 +65,8 @@ class MainWindow(QMainWindow):
         self.frames = FrameProvider(parent=self)
         self.thumbs = ThumbLoader(self)
         self.client = EngineClient(self)
+        self.masks = MaskController(self.client, self.frames, self.settings.cache_dir, self)
+        self._mask_prev: Optional[tuple] = None     # (layout, view A) to restore when the mask tool closes
         self.clip: Optional[Clip] = None
         self.render: Optional[Render] = None
         self.frame = 0
@@ -79,6 +82,7 @@ class MainWindow(QMainWindow):
         self._save_timer = QTimer(self, singleShot=True, interval=600, timeout=self._save_project)
         self._play_timer = QTimer(self, timeout=self._tick)
         self._play_timer.setTimerType(Qt.PreciseTimer)
+        self._mask_focus_timer = QTimer(self, singleShot=True, interval=250, timeout=self._mask_focus)
 
         self.restore_layout()
         self._sync_zoom_box()
@@ -233,6 +237,8 @@ class MainWindow(QMainWindow):
         cv.setSpacing(0)
         cv.addWidget(self._viewer_bar())
         cv.addWidget(hline())
+        self.mask_bar = self._mask_bar()
+        cv.addWidget(self.mask_bar)
         self.viewer = GLViewer()
         cv.addWidget(self.viewer, 1)
         cv.addWidget(hline())
@@ -361,6 +367,18 @@ class MainWindow(QMainWindow):
         self.lb_b = label("B", "Dim")
         for wdg in (self.lb_a, self.cb_a, self.lb_b, self.cb_b):
             h.addWidget(wdg)
+        h.addWidget(vline())
+        self.bt_mask = QToolButton()
+        self.bt_mask.setObjectName("Toggle")
+        self.bt_mask.setProperty("accent", True)
+        self.bt_mask.setText("Mask")
+        self.bt_mask.setIcon(icons.svg("scan", "ACCENT_FG", 16, off="TEXT_DIM"))
+        self.bt_mask.setIconSize(QSize(16, 16))
+        self.bt_mask.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.bt_mask.setCheckable(True)
+        self.bt_mask.setToolTip("Click to mask (M): draw a hint matte on this frame with SAM 2.1.\n"
+                                "Left-click keeps, right-click removes, drag draws a box, middle-drag pans.")
+        h.addWidget(self.bt_mask)
         h.addStretch(1)
         h.addWidget(label("Render", "Dim"))
         self.cb_render = combo([])
@@ -386,6 +404,43 @@ class MainWindow(QMainWindow):
             self.cb_zoom.addItem(f"{z}%", z)
         self.cb_zoom.setToolTip("Fit, or a fixed zoom. Scroll on the viewer to zoom at the cursor.")
         h.addWidget(self.cb_zoom)
+        return w
+
+    def _mask_bar(self) -> QWidget:
+        """Shown while the mask tool is on: how to use it, what the engine is doing, and the actions."""
+        w = QWidget()
+        w.setObjectName("Panel")
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(10, 4, 8, 4)
+        h.setSpacing(8)
+        self.lb_mask_help = label("Left-click keeps   Right-click removes   Drag draws a box   Middle-drag pans",
+                                  "Faint")
+        h.addWidget(self.lb_mask_help)
+        self.lb_mask = QLabel("")
+        self.lb_mask.setObjectName("Dim")
+        self.lb_mask.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        h.addWidget(self.lb_mask, 1)
+        self.bt_mask_dl = QPushButton("Download model")
+        self.bt_mask_dl.setToolTip("SAM 2.1 tiny from Meta (Apache-2.0), about 150 MB, saved in the cache folder")
+        self.bt_mask_undo = QPushButton("Undo")
+        self.bt_mask_undo.setToolTip("Undo the last point, box or Clear (Ctrl+Z)")
+        self.bt_mask_clear = QPushButton("Clear")
+        self.bt_mask_clear.setToolTip("Remove every point and the box on this frame")
+        self.bt_mask_use = QPushButton("Use as hint")
+        self.bt_mask_use.setObjectName("Primary")
+        self.bt_mask_use.setToolTip("Save this mask in the project and use it as the first-frame hint. "
+                                    "The in-point moves to this frame, where a first-frame hint applies.")
+        self.bt_mask_done = QPushButton("Done")
+        self.bt_mask_done.setToolTip("Leave the mask tool (Esc)")
+        for b in (self.bt_mask_dl, self.bt_mask_undo, self.bt_mask_clear, self.bt_mask_use, self.bt_mask_done):
+            h.addWidget(b)
+        outer.addWidget(row)
+        outer.addWidget(hline())
+        w.setVisible(False)
         return w
 
     def _transport(self) -> QWidget:
@@ -458,6 +513,7 @@ class MainWindow(QMainWindow):
         self.inspector.queueRequested.connect(lambda: self._render(self.clip, hold=True))
         self.inspector.setInRequested.connect(lambda: self._set_point("in"))
         self.inspector.setOutRequested.connect(lambda: self._set_point("out"))
+        self.inspector.hintFrameRequested.connect(self._hint_frame_requested)
 
         self.seg_layout.changed.connect(self._layout_changed)
         self.cb_a.currentIndexChanged.connect(self.update_viewer)
@@ -486,6 +542,17 @@ class MainWindow(QMainWindow):
         self.client.jobRemoved.connect(self.queue.remove_job)
         self.client.system.connect(self._system)
         self.client.requestFailed.connect(lambda m: self._message(m, error=True))
+
+        self.bt_mask.toggled.connect(self._mask_tool)
+        self.viewer.maskClicked.connect(
+            lambda x, y, keep: self._mask_edit(lambda s: s.add_point(x, y, keep)))
+        self.viewer.maskBoxed.connect(lambda x0, y0, x1, y1: self._mask_edit(lambda s: s.set_box(x0, y0, x1, y1)))
+        self.masks.changed.connect(self._mask_refresh)
+        self.bt_mask_dl.clicked.connect(self.masks.download)
+        self.bt_mask_undo.clicked.connect(lambda: self._mask_edit(lambda s: s.undo()))
+        self.bt_mask_clear.clicked.connect(lambda: self._mask_edit(lambda s: s.clear()))
+        self.bt_mask_use.clicked.connect(self._use_mask_as_hint)
+        self.bt_mask_done.clicked.connect(lambda: self.bt_mask.setChecked(False))
         self._layout_changed(GLViewer.SINGLE)
 
     def _shortcuts(self) -> None:
@@ -505,9 +572,18 @@ class MainWindow(QMainWindow):
         sc("Alt+I", lambda: self._clear_point("in"))
         sc("Alt+O", lambda: self._clear_point("out"))
         sc("F", self.viewer.fit_view)
-        sc("1", lambda: self.seg_layout.set_current(GLViewer.SINGLE, emit=True))
-        sc("2", lambda: self.seg_layout.set_current(GLViewer.WIPE, emit=True))
-        sc("3", lambda: self.seg_layout.set_current(GLViewer.SIDE, emit=True))
+        for keys, mode in (("1", GLViewer.SINGLE), ("2", GLViewer.WIPE), ("3", GLViewer.SIDE)):
+            # the mask tool holds the layout at Single
+            sc(keys, lambda m=mode: self.bt_mask.isChecked() or self.seg_layout.set_current(m, emit=True))
+        sc("M", self.bt_mask.toggle)
+        self.mask_shortcuts = []
+        for keys, fn in (("Esc", lambda: self.bt_mask.setChecked(False)),
+                         ("Ctrl+Z", lambda: self._mask_edit(lambda s: s.undo()))):
+            s = QShortcut(QKeySequence(keys), self)
+            s.setContext(Qt.WindowShortcut)
+            s.activated.connect(fn)
+            s.setEnabled(False)                     # only while the mask tool is on
+            self.mask_shortcuts.append(s)
         sc("Ctrl+O", self._import_dialog)
         sc("Ctrl+R", lambda: self._render(self.clip))
         sc("Ctrl+Shift+R", lambda: self._render(self.clip, hold=True))
@@ -594,6 +670,8 @@ class MainWindow(QMainWindow):
 
     def _select_clip(self, clip: Optional[Clip]) -> None:
         self.stop()
+        if self.viewer.mask_tool and (clip is None or clip.error):
+            self.bt_mask.setChecked(False)
         self.clip = clip
         self._shown.clear()
         self.inspector.set_clip(clip)
@@ -627,6 +705,7 @@ class MainWindow(QMainWindow):
         self._save_timer.start()
         if self.clip:
             self.client.disk_path = _existing_parent(self.clip.render_root())
+            self.update_viewer()                    # Despill previews live in the Composite view
 
     # ================================================================== range
     def _sync_range_to_timeline(self) -> None:
@@ -680,6 +759,9 @@ class MainWindow(QMainWindow):
         self.lb_frame.setText(str(f))
         self.lb_range.setText(f"{first}–{last}")
         self.update_viewer()
+        if self.viewer.mask_tool:
+            self._mask_focus_timer.start()
+            self._mask_refresh()
 
     def step(self, d: int) -> None:
         self.stop()
@@ -811,6 +893,10 @@ class MainWindow(QMainWindow):
                 side.note = f"Cannot read {os.path.basename(path)}" if err else "Loading…"
         side.color, side.alpha = frames.get("color"), frames.get("alpha")
         side.mode = {"composite": MODE_COMPOSITE, "matte": MODE_MATTE}.get(view, MODE_COLOR)
+        if view == "composite":
+            # the fg output is never despilled (only checker and cutout are): apply the clip's Despill here, live
+            side.despill = c.settings.despill
+            side.label = f"Composite   despill {side.despill:.2f}"
         return side
 
     def update_viewer(self) -> None:
@@ -845,6 +931,139 @@ class MainWindow(QMainWindow):
         self.cb_zoom.blockSignals(True)
         self.cb_zoom.setCurrentIndex(idx)
         self.cb_zoom.blockSignals(False)
+
+    # ================================================================== click to mask
+    def _mask_tool(self, on: bool) -> None:
+        """The tool shows the plate alone (Single, plate on A) and puts the layout back when it closes."""
+        if on and (self.clip is None or self.clip.error):
+            self.bt_mask.setChecked(False)
+            self._message("Select a clip to draw a mask on." if self.clip is None else
+                          "This clip's file is missing.", error=True)
+            return
+        if on == self.viewer.mask_tool:
+            return
+        if on:
+            self.stop()
+            self._mask_prev = (self.viewer.layout_mode, self.cb_a.currentIndex())
+            self.seg_layout.set_current(GLViewer.SINGLE, emit=True)
+            self.cb_a.setCurrentIndex(self.cb_a.findData("plate"))
+            self.masks.enter()
+        else:
+            self._mask_focus_timer.stop()
+            self.masks.leave()
+            if self._mask_prev:
+                layout, idx = self._mask_prev
+                self._mask_prev = None
+                self.seg_layout.set_current(layout, emit=True)
+                self.cb_a.setCurrentIndex(idx)
+        for w in (self.seg_layout, self.cb_a):
+            w.setEnabled(not on)
+        for s in self.mask_shortcuts:
+            s.setEnabled(on)
+        self.viewer.set_mask_tool(on)
+        self.mask_bar.setVisible(on)
+        if on:
+            self.viewer.setFocus()
+            self._mask_focus()
+        else:
+            self._mask_refresh()
+
+    def _mask_focus(self) -> None:
+        """Prepare the frame on screen once the playhead settles, so the first click is quick."""
+        if self.viewer.mask_tool and self.clip and not self.playing:
+            self.masks.focus(self.clip, self.frame)
+        self._mask_refresh()
+
+    def _mask_edit(self, fn) -> None:
+        if self.viewer.mask_tool and self.clip is not None:
+            self.stop()
+            self.masks.edit(self.clip, self.frame, fn)
+
+    def _mask_session(self):
+        if self.clip is None or not self.viewer.mask_tool:
+            return None
+        return self.masks.session(self.clip, self.frame, create=False)
+
+    def _mask_refresh(self) -> None:
+        s = self._mask_session()
+        if not self.viewer.mask_tool:
+            self.viewer.set_mask(None)
+            return
+        if s is None:
+            self.viewer.set_mask(None)
+        else:
+            self.viewer.set_mask(s.mask_frame(), s.mask_key, s.points, s.box)
+        m = self.masks
+        err = False
+        if m.unavailable:
+            text, err = m.unavailable, True
+        elif m.engine is None:
+            text = "Checking the mask model…"
+        elif m.engine.get("downloading"):
+            text = "Downloading the mask model…"
+        elif not m.model_ready():
+            text, err = (m.error, True) if m.error else ("The mask model (SAM 2.1 tiny) isn't downloaded yet.", False)
+        elif m.loading_model():
+            text = "Loading the mask model. The first time can take a minute…"
+        elif s is not None and s.writing:
+            text = f"Preparing frame {s.frame}…"
+        elif m.busy():
+            text = "Working…"
+        elif m.error:
+            text, err = m.error, True
+        elif s is None or s.empty():
+            text = f"Frame {self.frame}: click the subject to keep."
+        elif s.fresh():
+            where = "  (on the CPU while a render runs)" if m.device == "cpu" else ""
+            text = f"Frame {s.frame}: {s.summary()}, model confidence {s.score:.2f}{where}"
+        else:
+            text = f"Frame {s.frame}: {s.summary()}"
+        self.lb_mask.setText(text)
+        self.lb_mask.setToolTip(text)
+        self.lb_mask.setStyleSheet(f"color: {T.c('ERROR')};" if err else "")
+        self.bt_mask_dl.setVisible(bool(m.engine) and not m.model_ready() and not m.engine.get("downloading")
+                                   and not m.unavailable)
+        self.bt_mask_undo.setEnabled(bool(s and s.history))
+        self.bt_mask_clear.setEnabled(bool(s and not s.empty()))
+        self.bt_mask_use.setEnabled(bool(s and s.fresh()) and not m.busy())
+
+    def _use_mask_as_hint(self) -> None:
+        """Save the mask in masks/<clip>/ and make it the first-frame hint. A first-frame hint applies at the
+        in-point, so the in-point moves to the mask's frame (and says so)."""
+        clip, s = self.clip, self._mask_session()
+        if clip is None or s is None or s.clip_id != clip.id or not s.fresh() or self.masks.busy():
+            self._message("Wait for the mask to catch up with your clicks first.", error=True)
+            return
+        path = hint_file(clip.masks_dir(), s.frame)
+        try:
+            write_png(path, s.mask)
+        except (OSError, ValueError) as e:
+            self._message(f"Cannot save the mask: {e}", error=True)
+            return
+        before = clip.frame_range()
+        st = clip.settings
+        st.hint_mode, st.hint_path, st.hint_frame = "first", path, s.frame
+        first, last = clip.hint_range(s.frame)
+        self.inspector.set_clip(clip)
+        self.inspector.set_range(first, last, custom=not (first == 0 and last == clip.last_frame))
+        self._sync_range_to_timeline()
+        self.set_frame(self.frame)                       # range readout
+        self._save_timer.start()
+        text = f"Hint saved from frame {s.frame}. Renders now run {first}–{last}"
+        if before[0] != first:
+            text += f": the in-point moved from {before[0]} to {first}, where a first-frame hint applies"
+        self._message(text + ".")
+
+    def _hint_frame_requested(self) -> None:
+        """Inspector: put the in-point back on the frame the hint was drawn on."""
+        clip = self.clip
+        if clip is None or clip.settings.hint_frame < 0:
+            return
+        first, last = clip.hint_range(clip.settings.hint_frame)
+        self.inspector.set_range(first, last, custom=not (first == 0 and last == clip.last_frame))
+        self._sync_range_to_timeline()
+        self.set_frame(self.frame)
+        self._save_timer.start()
 
     # ================================================================== renders
     def _fill_render_box(self) -> None:
@@ -1059,6 +1278,8 @@ class MainWindow(QMainWindow):
     def _engine_connected(self, on: bool) -> None:
         self.st_engine.setText("● Engine connected" if on else "○ Engine offline, reconnecting…")
         self.st_engine.setStyleSheet(f"color: {T.c('OK' if on else 'WARN')};")
+        if on and self.viewer.mask_tool:
+            self.masks.refresh()
 
     def _system(self, info: dict) -> None:
         g = info.get("gpu")
@@ -1123,6 +1344,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e) -> None:
         self.stop()
+        self.bt_mask.setChecked(False)              # asks the engine to free the mask model
         self.save_layout()
         self._save_project()
         self.client.close()

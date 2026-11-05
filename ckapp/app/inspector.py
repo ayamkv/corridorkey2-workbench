@@ -26,6 +26,7 @@ class Inspector(QWidget):
     queueRequested = Signal()
     setInRequested = Signal()
     setOutRequested = Signal()
+    hintFrameRequested = Signal()           # move the in-point to the frame the hint was drawn on
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -156,6 +157,21 @@ class Inspector(QWidget):
         h.addWidget(self.bt_hint)
         h.addWidget(self.bt_hint_clear)
         self.lb_hint_row = s.row("Matte", pick)
+        self.lb_hint_at = label("", "Faint")
+        s.full(self.lb_hint_at)
+        warn = QWidget()
+        h = QHBoxLayout(warn)
+        h.setContentsMargins(0, 0, 0, 0)
+        self.lb_hint_warn = QLabel("")
+        self.lb_hint_warn.setWordWrap(True)
+        self.lb_hint_warn.setStyleSheet(f"color: {T.c('WARN')}; font-size: 8.5pt;")
+        self.bt_hint_frame = QPushButton("Move in-point")
+        self.bt_hint_frame.setToolTip("Set the in-point to the frame this hint was drawn on")
+        self.bt_hint_frame.clicked.connect(self.hintFrameRequested)
+        h.addWidget(self.lb_hint_warn, 1)
+        h.addWidget(self.bt_hint_frame, 0, Qt.AlignTop)
+        self.hint_warn = warn
+        s.full(warn)
         self.sl_hint_q = SliderRow(0.0, 1.0, 0.95)
         self.lb_hint_q = s.row("Strength", self.sl_hint_q, "How much to trust the hint (hint_quality)")
         self.ck_carry = QCheckBox("Carry the hint between frames")
@@ -497,6 +513,14 @@ class Inspector(QWidget):
         self.lb_carry_q.setVisible(show_carry)
         self.lb_hint.set_full_text(s.hint_path or "None attached")
         self.bt_hint_clear.setEnabled(bool(s.hint_path))
+        drawn = s.hint_mode == "first" and bool(s.hint_path) and s.hint_frame >= 0
+        self.lb_hint_at.setText(f"Drawn on frame {s.hint_frame} with the mask tool." if drawn else "")
+        self.lb_hint_at.setVisible(drawn)
+        off = c.hint_mismatch()
+        if off is not None:
+            self.lb_hint_warn.setText(f"This hint was drawn on frame {off}, but the in-point is {first}. "
+                                      "A first-frame hint applies at the in-point.")
+        self.hint_warn.setVisible(off is not None)
         self.sec_input.setVisible(c.kind == "sequence")
         exr = s.output_format == "exr"
         self.cb_exr.setVisible(exr)
@@ -563,6 +587,7 @@ class Inspector(QWidget):
                                                   "Images (*.png *.jpg *.jpeg *.exr *.tif *.tiff)")
         if path:
             self.clip.settings.hint_path = os.path.normpath(path)
+            self.clip.settings.hint_frame = -1                 # a chosen file: no known frame
             if self.clip.settings.hint_mode == "none":
                 self.cb_hint.setCurrentIndex(self.cb_hint.findData("first"))
             self._edited()
@@ -570,6 +595,7 @@ class Inspector(QWidget):
     def _clear_hint(self) -> None:
         if self.clip is not None:
             self.clip.settings.hint_path = ""
+            self.clip.settings.hint_frame = -1
             self._edited()
 
     def _choose_outdir(self) -> None:

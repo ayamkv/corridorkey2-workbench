@@ -30,6 +30,8 @@ def main() -> int:
     ap.add_argument("--play-seconds", type=float, default=0, help="play back and report achieved fps")
     ap.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
                     help="clip settings, e.g. output_format=exr outputs=alpha,fg despill=0.3")
+    ap.add_argument("--mask", type=float, nargs=2, default=None, metavar=("X", "Y"),
+                    help="mask tool: keep-click at this fraction of the frame, Use as hint (then --render)")
     args = ap.parse_args()
     os.environ.setdefault("CK2WB_STATE", tempfile.mkdtemp(prefix="ckstate-"))
     os.makedirs(args.out_dir, exist_ok=True)
@@ -121,7 +123,10 @@ def main() -> int:
                     win.set_frame = counting
                     win.toggle_play()
                     return
-                if args.submit_and_quit:
+                if args.mask:
+                    win.bt_mask.setChecked(True)
+                    state["phase"], state["tm"] = "mask_ready", time.time()
+                elif args.submit_and_quit:
                     win._render(clip)
                     state["phase"] = "submitted"
                 elif args.render:
@@ -129,6 +134,38 @@ def main() -> int:
                     state["phase"] = "rendering"
                 else:
                     app.exit(0)
+        elif state["phase"] == "mask_ready":
+            m, s = win.masks, win.masks.current
+            if m.unavailable or (m.error and not m.busy()):
+                print("mask problem:", m.unavailable or m.error, flush=True)
+                shot("02_mask_problem")
+                app.exit(3)
+            elif s and s.image_ready and m.model_ready() and not m.busy() and m.engine.get("running"):
+                print(f"mask: model loaded and frame {s.frame} embedded in {time.time() - state['tm']:.1f} s "
+                      f"on {m.device}", flush=True)
+                x, y = args.mask
+                state["tc"] = time.time()
+                win.viewer.maskClicked.emit(x * clip.width, y * clip.height, True)
+                state["phase"] = "mask_wait"
+        elif state["phase"] == "mask_wait":
+            s = win.masks.current
+            if s.fresh():
+                print(f"mask: click -> mask in {(time.time() - state['tc']) * 1000:.0f} ms, score {s.score:.3f}, "
+                      f"area {s.mask.mean() / 255:.3f}, device {win.masks.device}", flush=True)
+                shot("02_mask")
+                win.bt_mask_use.click()
+                print("use as hint:", win.st_msg.text(), "| range", clip.frame_range(), "| hint",
+                      clip.settings.hint_path, flush=True)
+                shot("03_hint_set")
+                win.bt_mask.setChecked(False)
+                if args.render:
+                    win._render(clip)
+                    state["phase"] = "rendering"
+                else:
+                    app.exit(0)
+            elif win.masks.error:
+                print("mask error:", win.masks.error, flush=True)
+                app.exit(3)
         elif state["phase"] == "playing":
             dt = time.time() - state["t3"]
             if dt >= args.play_seconds:

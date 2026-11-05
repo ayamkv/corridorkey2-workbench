@@ -89,6 +89,7 @@ class EngineClient(QObject):
     jobRemoved = Signal(str)
     logLine = Signal(str, str)
     system = Signal(dict)
+    maskStatus = Signal(dict)           # the mask model: downloaded, downloading, running, device, error
     requestFailed = Signal(str)
     _started = Signal(dict)
 
@@ -193,6 +194,8 @@ class EngineClient(QObject):
             self.jobRemoved.emit(payload["id"])
         elif kind == "log":
             self.logLine.emit(payload["id"], payload["line"])
+        elif kind == "mask":
+            self.maskStatus.emit(payload)
 
     def _sse_closed(self, reply: QNetworkReply) -> None:
         reply.deleteLater()
@@ -204,9 +207,13 @@ class EngineClient(QObject):
 
     # -- commands --------------------------------------------------------------------------
     def _send(self, method: str, path: str, body: Optional[dict] = None,
-              done: Optional[Callable[[dict], None]] = None, quiet: bool = False) -> None:
+              done: Optional[Callable[[dict], None]] = None, quiet: bool = False,
+              fail: Optional[Callable[[str, int], None]] = None) -> None:
+        """`fail(detail, http_status)` replaces the requestFailed signal for this call (status 0: no answer)."""
         if not self.info:
-            if not quiet:
+            if fail:
+                fail("not connected to the render engine", 0)
+            elif not quiet:
                 self.requestFailed.emit("not connected to the render engine")
             return
         req = self._request(path)
@@ -224,7 +231,9 @@ class EngineClient(QObject):
                 payload = {}
             if reply.error() != QNetworkReply.NoError and not (200 <= int(status) < 300):
                 detail = payload.get("detail") if isinstance(payload, dict) else None
-                if not quiet:
+                if fail:
+                    fail(str(detail or reply.errorString()), int(status))
+                elif not quiet:
                     self.requestFailed.emit(detail or reply.errorString())
             elif done:
                 done(payload)
@@ -237,8 +246,10 @@ class EngineClient(QObject):
 
     def can_hold(self) -> bool:
         """Engines before 0.4.0 ignore "hold" and would start the job at once."""
-        from .. import __version__
-        return self.engine_version == __version__
+        try:
+            return tuple(int(p) for p in self.engine_version.split(".")[:3]) >= (0, 4, 0)
+        except ValueError:
+            return False
 
     def submit(self, spec: dict, done: Callable[[dict], None], hold: bool = False) -> None:
         self._send("POST", "/jobs", dict(spec, hold=True) if hold else spec, done)
@@ -260,6 +271,25 @@ class EngineClient(QObject):
 
     def fetch_log(self, job_id: str, done: Callable[[dict], None]) -> None:
         self._send("GET", f"/jobs/{job_id}?log=true", None, done)
+
+    # -- click to mask (the engine runs SAM 2.1 tiny between renders) ---------------------------
+    def mask_status(self, done: Callable[[dict], None], fail: Callable[[str, int], None]) -> None:
+        self._send("GET", "/mask", None, done, fail=fail)
+
+    def mask_download(self, done: Callable[[dict], None], fail: Callable[[str, int], None]) -> None:
+        self._send("POST", "/mask/download", None, done, fail=fail)
+
+    def mask_open(self, image: str, done: Callable[[dict], None], fail: Callable[[str, int], None]) -> None:
+        self._send("POST", "/mask/open", {"image": image}, done, fail=fail)
+
+    def mask_predict(self, image: str, points: list, box: Optional[list], out: str,
+                     done: Callable[[dict], None], fail: Callable[[str, int], None]) -> None:
+        self._send("POST", "/mask/predict", {"image": image, "points": points, "box": box, "out": out}, done,
+                   fail=fail)
+
+    def mask_stop(self) -> None:
+        """Frees the GPU memory the mask model holds (about 0.5 GB)."""
+        self._send("POST", "/mask/stop", None, None, quiet=True)
 
     def poll_system(self) -> None:
         if self.info and self.connected:

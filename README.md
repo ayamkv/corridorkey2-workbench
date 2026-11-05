@@ -20,6 +20,8 @@ app runs the **unmodified** upstream code.
   views, in Single, Wipe and Side-by-side layouts.
   - Zoom at the cursor, pan, fit, and pixel-peeping (nearest-neighbour filtering at 200% and above).
   - EXR outputs are shown from scene-linear half floats.
+  - Composite applies the clip's **Despill** live, with upstream's own formula. Upstream's `fg` output is never
+    despilled (only `checker` and `cutout` are), so moving the slider previews the despill without re-rendering.
   - Measured real-time playback: 24 fps at 4K and 1080p.
 - **Cavalry-style timeline.** An `F` frame field, a numbered ruler, a playhead, and **in/out handles**
   (Entire clip or Custom in/out). The area outside the range is dimmed, and there's a filmstrip and a
@@ -29,6 +31,15 @@ app runs the **unmodified** upstream code.
   - Seeks were verified exact on H.264 (with B-frames), HEVC and ProRes.
   - EXR outputs are numbered by source frame.
   - Hints apply to the in-point.
+- **Click to mask.** Press **Mask** (M) in the viewer bar and click the subject. SAM 2.1 tiny draws a matte on
+  that frame. Left-click keeps, right-click removes, a drag draws a box, and middle-drag pans. Undo (Ctrl+Z) and
+  Clear work too.
+  - **Use as hint** saves the matte in `masks\<clip>\` and makes it the first-frame hint. A first-frame hint applies
+    at the in-point, so the in-point moves to that frame, and the app says so. The Inspector warns if the in-point
+    later moves away from it.
+  - The model (about 150 MB, Apache-2.0) is downloaded only when you press Download in the mask bar. It runs in
+    the engine, on the GPU between renders and on the CPU while a render runs. The engine stops it before every
+    render, and about 30 s after the app closes, so its GPU memory goes back to renders.
 - **Inspector.** Frame Range, GPU Memory (Auto / Low VRAM / Manual), Alpha Hint (first frame / full hint
   video, strengths, carry), Despill, Image Sequence (linear EXR, fps), Outputs (matte / fg / checker /
   cutout) and Export:
@@ -99,6 +110,7 @@ in **Settings**: the CorridorKey folder, its python, the cache/staging folder an
 | Alt+I / Alt+O | Clear in / out |
 | 1 / 2 / 3 | Single / Wipe / Side by side |
 | F, or double-click | Fit the view |
+| M | Mask tool on / off (Esc leaves it; Ctrl+Z undoes a click) |
 | Timeline: scroll / middle-drag | Zoom / pan (stays on the clip); right-click for Fit to view, Zoom to in/out |
 | Timeline: drag the in/out bar | Slide the whole range |
 | Right-click the top bar | Icons and labels, or icons only |
@@ -114,6 +126,8 @@ in **Settings**: the CorridorKey folder, its python, the cache/staging folder an
   - `jobs.py`: the job spec, the infer command line, the progress parser and a single-GPU queue.
   - `server.py`: the HTTP API (REST plus Server-Sent Events). A token is always required.
   - `ck_run.py`: runs in the CorridorKey venv.
+  - `masks.py` + `sam_worker.py`: click to mask. SAM 2.1 tiny runs in CorridorKey's venv (torch and transformers
+    are already there) as one long-lived worker that keeps the current frame's embedding, so each click is quick.
   - The engine writes `engine.json` (port and token) to `%APPDATA%\CorridorKey2Workbench` and exits after
     10 idle minutes.
   - LAN hosting is a later phase. `python -m ckapp.engine --lan` already binds `0.0.0.0` behind the same
@@ -124,6 +138,7 @@ in **Settings**: the CorridorKey folder, its python, the cache/staging folder an
   - `frames.py`: one decode thread per file, plus a shared LRU cache.
   - `media.py`: frame numbering identical to upstream.
   - `project.py`: the project folder and file, recent projects, where new projects go (no Qt).
+  - `masking.py`: the mask tool's per-frame sessions (points, box, undo) and its engine calls.
   - `inspector.py`, `panels.py`, `start.py`, `main_window.py`
 
 ## Tests
@@ -132,6 +147,7 @@ in **Settings**: the CorridorKey folder, its python, the cache/staging folder an
 .venv\Scripts\python -m pytest tests -q                    # engine, app logic, headless UI (no GPU)
 D:\CODE\CorridorKey2.0\.venv\Scripts\python tests\test_seek_accuracy.py
 .venv\Scripts\python tests\smoke_app.py <clip> <shots dir> --render --range 4 15 --layout wipe
+.venv\Scripts\python tests\smoke_app.py <clip> <shots dir> --frame 40 --mask 0.5 0.55 --render   # click to mask
 ```
 
 `smoke_app.py` drives the real app on the real GPU and saves screenshots.
@@ -142,6 +158,9 @@ D:\CODE\CorridorKey2.0\.venv\Scripts\python tests\test_seek_accuracy.py
   (`ckapp/app/assets/fonts/OFL-Geist.txt`).
 - Icons: the Workbench set (drawn for this app), plus [Lucide](https://lucide.dev) (ISC license) for folder-open, plus, x,
   trash-2, scan, circle-alert, hard-drive and cpu.
+- Click to mask uses [SAM 2.1](https://github.com/facebookresearch/sam2) (hiera-tiny) by Meta, Apache License 2.0,
+  through Hugging Face `transformers`. The weights (`facebook/sam2.1-hiera-tiny`, pinned revision, safetensors only)
+  are downloaded on request and are not part of this repo.
 
 ## License
 

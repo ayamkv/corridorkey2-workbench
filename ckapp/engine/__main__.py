@@ -66,16 +66,16 @@ def main(argv: list[str] | None = None) -> None:
     discovery_path().write_text(json.dumps(info), encoding="utf-8")
     print(f"engine listening on {host}:{port} (pid {os.getpid()})", flush=True)
 
-    if args.idle_exit > 0:
-        def idle_watch():
-            idle_since = time.time()
-            while not server.should_exit:
-                time.sleep(5)
-                if queue.busy() or bus.count():
-                    idle_since = time.time()
-                elif time.time() - idle_since > args.idle_exit * 60:
-                    server.should_exit = True
-        threading.Thread(target=idle_watch, daemon=True).start()
+    def idle_watch():
+        idle_since = time.time()
+        while not server.should_exit:
+            time.sleep(5)
+            masks.idle_check(bus.count(), time.time())          # free the mask model once no app is connected
+            if queue.busy() or bus.count():
+                idle_since = time.time()
+            elif args.idle_exit > 0 and time.time() - idle_since > args.idle_exit * 60:
+                server.should_exit = True
+    threading.Thread(target=idle_watch, daemon=True).start()
 
     try:
         server.run()

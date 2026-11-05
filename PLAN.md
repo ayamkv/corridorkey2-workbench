@@ -7,7 +7,7 @@
 > - Geist (bundled) with tabular figures; the Workbench icon set plus Lucide
 > - the frame readout as the one bold element
 >
-> Next is Phase 3 (projects: renders go inside the project folder), then Phase 4 (click to mask with SAM 2.1 tiny).
+> Phase 3 (projects) and Phase 4 (click to mask with SAM 2.1 tiny) are done on branch `phase-3-4`. Next is Phase 5 (LAN hosting).
 
 ## Context
 CorridorKey 2.0 (github.com/nikopueringer/CorridorKey2.0) is Corridor Digital's open-source ML green/blue-screen keyer. The repo has no GUI, only `infer.py`, a terminal Q&A script and a drag-and-drop `.bat`. The official Workbench app is a separate paid product.
@@ -199,6 +199,29 @@ Decisions made:
 - **Renders that finish for a project that isn't open are written into that project's file**: on live events,
   and on the engine's hello after a relaunch. Otherwise Clear finished could make the engine forget them first.
 - **`project.json` has its own format version.** A newer file is refused rather than opened and saved over.
+
+## Phase 4 decisions: click to mask (2026-11-04)
+- **SAM runs in the engine, not the app.** The app never imports torch. The worker uses CorridorKey's venv, which
+  already has torch and transformers, so the installer gets no new dependencies. The weights come only from an
+  explicit Download button.
+- **The image SAM sees is the frame on screen, in display colours.** The plate frame is decoded again for exactly
+  frame F (the viewer may still show the previous frame while decoding). It is sRGB-encoded like the viewer and
+  written atomically, because the worker keys its embedding cache on the file's mtime.
+- **The mask is a prompt result, not the hint itself, until "Use as hint".** That writes a new file in
+  `masks/<clip>/` and never overwrites one, because a past render may have used it.
+- **A first-frame hint applies at the in-point**, so Use as hint moves the in-point to the mask's frame. If the
+  out-point was before it, the range runs to the end of the clip, never a one-frame render. Moving the in-point
+  later only warns; it doesn't block (`hint_frame` records where the hint was drawn).
+- **One request in flight, latest edit wins.** Edits made while a request is out go out together when it answers.
+  Answers for an older edit are dropped, so a stale mask can't be used as a hint.
+- **The engine frees the model 30 s after the last app disconnects.** The app also asks on Done/Esc, but an app that
+  is closing can't be relied on to deliver that request.
+- **Non-ASCII paths: `ck_run.py` wraps `cv2.imread`** with a bytes + `imdecode` fallback that is used only when the
+  original returns None. Upstream reads hint images and frame folders with `cv2.imread`, which fails on non-ASCII
+  Windows paths, and drawn hints live under the project and clip folder names. Video input through
+  `cv2.VideoCapture` is a separate question and wasn't changed.
+- **Version 0.5.0**, so an idle 0.4.0 engine (without the release-on-disconnect) is replaced. Holding jobs needs
+  an engine of at least 0.4.0, compared by version number.
 
 ## Verification
 - Phase 1: the CLI smoke test writes `_alpha.mp4` and `_fg.mp4`. `nvidia-smi` shows peak VRAM under 4 GB.

@@ -4,7 +4,7 @@ CorridorKey2 Workbench: an unofficial native desktop app for
 [CorridorKey 2.0](https://github.com/nikopueringer/CorridorKey2.0).
 Check items off as they land. Decisions and the reasons for them live in `PLAN.md`.
 
-## Where we left off (2026-10-30)
+## Where we left off (2026-11-04)
 
 Read this first when picking the work back up.
 
@@ -14,15 +14,22 @@ Read this first when picking the work back up.
   - The app icon `ckapp/app/assets/app.ico`.
   - ffmpeg detection in `tools\ffmpeg`.
   - `dist/` is in `.gitignore`.
-- Branch **`phase-3-4`** is local only and not pushed. It was rebased onto `main` (0.3.1) on 2026-10-30 and holds:
+- Branch **`phase-3-4`** is local only and not pushed. It is based on `main` (0.3.1) and holds:
   - The engine WIP commit: held jobs (`HELD`, `submit(hold=)`, `start()`, a `before_run` hook), the SAM 2.1 tiny
     worker (`sam_worker.py`), `MaskService` (`masks.py`), the `/jobs/start`, `/jobs/{id}/start` and `/mask*` endpoints.
   - **Phase 3 (0.4.0)**: projects, the start page, held jobs in the UI, jobs across projects and the GPU memory guide.
-    97 tests pass. Not yet tried in the real windowed app or on the GPU: do one real-app pass (with `CK2WB_STATE` set
-    to a scratch folder) before merging to `main`.
-- The SAM weights are already downloaded to `.cache/models/sam2.1-hiera-tiny`. They are pinned to revision `de431c40…` and the folder is git-ignored.
-  - Measured on the RTX 3050 Ti: embedding a 1080p frame takes 0.15 s on the GPU, and each click takes 15 ms. Peak VRAM is 511 MB.
-  - On the CPU, embedding takes 1.3 s and each click 45 ms.
+  - **Phase 4 (0.5.0)**: click to mask in the app (see below). 119 tests pass, 1 skipped (a GL pixel test that
+    can't run headless; it was run on real GL instead).
+  - Real-app runs on the GPU (2026-11-04, scratch `CK2WB_STATE`, `tests/smoke_app.py --mask`) covered parts of
+    Phase 3 too: a new project, import, the inspector, a render into `renders/<clip>/render_001`. Projects
+    were not tried by hand (Open, Recent, moving a folder, the start page, held jobs, the queue across projects).
+    Do that before merging to `main`.
+- The SAM weights are already downloaded to `.cache/models/sam2.1-hiera-tiny` (149 MB). They are pinned to revision `de431c40…` and the folder is git-ignored.
+  - Measured on the RTX 3050 Ti in the real app (720×1280 clip): the mask tool's first frame is ready in 8.5 s
+    (worker start, model load and embedding). A click comes back as a mask in about 0.25–0.5 s, including HTTP and
+    the PNG round trip. Earlier, standalone: embedding a 1080p frame takes 0.15 s, a click 15 ms, peak VRAM 511 MB.
+  - On the CPU (while a render runs), a cold worker start took 37 s on 2026-11-04. After that, embedding takes 2.2 s
+    at 720p and each click 60–170 ms.
 
 **Studio package**
 - `dist\CorridorKey2-Workbench-0.3.1.zip` is 3.84 GB and includes the weights. It was built and verified on 2026-10-29: 116 entries, with all weight files at their original sizes.
@@ -34,8 +41,8 @@ Read this first when picking the work back up.
 
 **Still pending**
 - [ ] Rename the folder `D:\CODE\corridorkey2webui` to `D:\CODE\corridorkey2-workbench`. Close the running app and engine first: they lock the folder.
-- [ ] A real-app check of Phase 3, then merge `phase-3-4` into `main`.
-- [ ] Phase 4 UI work (below).
+- [ ] A hands-on check of projects in the real app (Open, Recent, a moved folder, held jobs), then merge `phase-3-4` into `main`.
+- [ ] Try the mask tool by hand on real footage: several keep/remove clicks, a box, Undo, a hint drawn while a render is running (CPU).
 
 **Rules for this machine**
 - C: is nearly full. Point TMP, TEMP and HF_HOME at `D:\CODE\_tmp`.
@@ -143,24 +150,53 @@ Read this first when picking the work back up.
       table against upstream's README.
 - [x] Version 0.4.0, so an idle older engine is replaced.
 
+### Phase 4: click to mask (2026-11-04, on branch `phase-3-4`, version 0.5.0)
+- [x] SAM 2.1 tiny worker run by the engine. It runs on the GPU between renders, is stopped before each render, and runs on the CPU while a render is going.
+- [x] Checked against the real model on the CPU before any UI work: points, a box, a box plus points, and a remove-click.
+- [x] Client calls: `/mask` status, `/mask/download` (only when the user presses Download), `/mask/open` (warms up the
+      frame on screen before the first click), `/mask/predict`, `/mask/stop`, and `mask` SSE events. An engine
+      without masks (404/501) gets a clear message.
+  - The app writes plate frame F (decoded for that exact frame, not whatever the viewer still shows) as an sRGB
+    PNG in the cache folder, written atomically. Linear EXR is encoded to sRGB, as the viewer shows it.
+  - One request at a time, and the latest edit wins: replies for an older edit are dropped.
+- [x] Viewer mask tool (`masking.py`, `viewer.py`):
+  - **Mask** in the viewer bar, M. Left-click keeps, right-click removes, a drag draws a box, middle-drag pans.
+    A double-click counts as two clicks, not Fit.
+  - Keep/remove dots and the box are drawn over the image. The mask is a third texture: kept areas get an
+    amber tint and outline, the rest is dimmed.
+  - The tool holds Single layout with the plate on A, and puts the layout and view back on exit.
+  - Undo (Ctrl+Z, and Clear can be undone), Clear, Done (Esc). Each frame keeps its own points while the tool is
+    open.
+- [x] "Use as hint": a new `masks/<clip>/hint_fNNNNNN.png` (8-bit, one channel, clip size; never overwrites one an
+      earlier render used), `hint_mode=first`, `hint_frame=F`. The in-point moves to F, the out-point stays (or
+      runs to the end if it was before F), and the status line says so.
+  - The Inspector shows "Drawn on frame F". If the in-point moves off F, it warns and offers **Move in-point**.
+  - `hint_path` is stored relative in `project.json`, so it moves with the project.
+- [x] The engine stops the mask worker 30 s after the last app disconnects. An app that is closing can't be relied on
+      to send `/mask/stop`. Found in the real-app run: the model held about 750 MB until the engine's
+      10-minute idle exit.
+- [x] Esc or Done while the model is still loading still frees it. Stop is always sent, and sent again if a load
+      finishes after the tool closed.
+- [x] Hints at non-ASCII paths (a project or clip folder like "tést"): upstream reads hints with `cv2.imread`, which
+      can't open them on Windows. `ck_run.py` now falls back to bytes + `imdecode` when it fails. Verified with a GPU
+      render from a project in `öut-tést`.
+- [x] Frame and mask PNGs in `<cache>/masks/` older than 12 hours are cleaned when the app starts.
+- [x] Real GPU check (`smoke_app.py --mask`) on a 720p tiger plate. One click masked the tiger (score 0.97).
+      Use as hint moved the in-point 30 → 40, and the render 40–55 finished with
+      `Hint First Frame: …hint_f000040.png` in upstream's `_settings.txt`. SAM 2.1 credited in the README.
+
+### Viewer: despill in Composite (2026-11-04)
+- [x] The Composite view showed the raw `fg`, which upstream never despills, so the Despill slider seemed to do
+      nothing (a user saw green inside a clear bottle). Composite now applies upstream's average despill
+      (`runtime.py` `_despill_average_srgb_torch`) in the shader at the clip's current Despill, so it previews live.
+      Checked on real GL against upstream's formula, for video and EXR: within 0.4/255.
+
 ## Next
 
-### Phase 4: click to mask (on-viewer hint)
-- [x] SAM 2.1 tiny worker run by the engine (branch `phase-3-4`). It runs on the GPU between renders, is stopped before each render, and runs on the CPU while a render is going.
-- [ ] Client calls: `/mask` status, `/mask/download` (an explicit button the user presses), and `/mask/predict` with `{image, points, box, out}`. Handle `mask` SSE events.
-  - The app writes the displayed plate frame as an sRGB PNG for SAM, using `to_display_u8` at full width. Linear EXR is encoded to sRGB.
-- [ ] Viewer mask tool:
-  - A toggle in the viewer bar, with a hotkey.
-  - Left-click keeps, right-click removes, a drag draws a box, and middle-drag pans while the tool is on.
-  - Points are drawn as keep/remove dots.
-  - The mask is a third texture in the shader, tinted over the plate.
-  - The tool forces Single layout with the plate on side A, and restores the previous layout on exit.
-  - Undo and Clear. Esc leaves the tool.
-- [ ] "Use as hint": **a first-frame hint applies at the in-point**.
-  - Using a mask drawn on frame F must set the in-point to F and say so.
-  - Save it as a single-channel 8-bit PNG at clip resolution in `masks/<clip>/`, then set `hint_mode=first` and the hint path. Record the frame number too.
-- [ ] One real-GPU check, then credit SAM 2.1 (Apache-2.0) in the README.
-- [ ] Later, if VRAM allows: propagate through the clip as a full hint video (SAM 2 video / MatAnyone).
+### Click to mask: later
+- [ ] Propagate through the clip as a full hint video (SAM 2 video / MatAnyone), if VRAM allows.
+- [ ] Keep each frame's points in the project, so they survive closing the app (today they're kept only while
+      it runs).
 
 ### Phase 5: LAN hosting
 - [ ] Settings toggle: engine binds 0.0.0.0 (token already required)

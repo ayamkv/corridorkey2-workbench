@@ -200,6 +200,7 @@ QToolButton#Toggle:checked {{ background: {k['PANEL_2']}; color: {k['TEXT']}; }}
 QWidget#JobRow {{ border-bottom: 1px solid {k['BORDER']}; }}
 QWidget#JobRow:hover {{ background: {k['PANEL_2']}; }}
 QToolButton#Toggle:hover {{ background: {k['PANEL_3']}; }}
+QToolButton#Toggle[accent="true"]:checked {{ background: {k['ACCENT']}; color: {k['ACCENT_FG']}; }}
 QToolButton#Section {{ border: none; background: transparent; font-family: "{UI_FAMILY}"; font-size: 9.5pt;
     font-weight: 600; padding: 7px 4px; }}
 

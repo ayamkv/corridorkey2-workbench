@@ -205,14 +205,39 @@ def thumbnail(path: str, *, at: float = 0.5, width: int = 192, linear: bool = Fa
     return to_display_u8(fr, width)
 
 
-def to_display_u8(fr: Frame, width: int) -> np.ndarray:
-    """Small display-referred uint8 RGB copy (thumbnails, filmstrip)."""
+def display_u8(fr: Frame) -> np.ndarray:
+    """Full-size display-referred uint8 copy, channel order kept (BGR or gray). Scene-linear is encoded to sRGB,
+    as the viewer shows it."""
     data = fr.data
     if data.dtype != np.uint8:
         x = np.clip(data.astype(np.float32), 0, None)
         if fr.linear:
             x = np.where(x <= 0.0031308, x * 12.92, 1.055 * np.power(x, 1 / 2.4) - 0.055)
         data = (np.clip(x, 0, 1) * 255 + 0.5).astype(np.uint8)
+    return data
+
+
+def write_png(path: str, img: np.ndarray) -> None:
+    """Atomic PNG write that survives non-ASCII Windows paths (readers never see half a file)."""
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        raise ValueError(f"cannot encode {path}")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    buf.tofile(tmp)
+    os.replace(tmp, path)
+
+
+def read_gray(path: str) -> Optional[np.ndarray]:
+    img = _imread(path)
+    if img is not None and img.ndim == 3:
+        img = img[..., 0]
+    return img
+
+
+def to_display_u8(fr: Frame, width: int) -> np.ndarray:
+    """Small display-referred uint8 RGB copy (thumbnails, filmstrip)."""
+    data = display_u8(fr)
     h = max(1, round(data.shape[0] * width / data.shape[1]))
     small = cv2.resize(data, (width, h), interpolation=cv2.INTER_AREA)
     if small.ndim == 2:

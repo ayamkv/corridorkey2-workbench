@@ -17,6 +17,7 @@ class ClipSettings:
     frame_out: int = -1               # -1 = last frame
     hint_mode: str = "none"           # none | first | video
     hint_path: str = ""
+    hint_frame: int = -1              # frame a drawn first-frame hint belongs to (-1: unknown, e.g. chosen file)
     hint_quality: float = 0.95
     carry_hint: bool = True
     carry_hint_quality: float = 0.95
@@ -182,6 +183,20 @@ class Clip:
 
     def masks_dir(self) -> str:
         return os.path.join(self.base, "masks", self.folder) if self.base and self.folder else self.render_root()
+
+    def hint_range(self, frame: int) -> tuple[int, int]:
+        """The range a first-frame hint drawn on `frame` needs: it applies at the in-point, so in = frame. The
+        out-point stays when it is still after it; otherwise the range runs to the end of the clip."""
+        frame = min(max(0, frame), self.last_frame)
+        _, last = self.frame_range()
+        return frame, last if last >= frame and self.settings.range_mode == "custom" else self.last_frame
+
+    def hint_mismatch(self) -> Optional[int]:
+        """The frame a drawn first-frame hint belongs to, when the in-point is somewhere else."""
+        s = self.settings
+        if s.hint_mode == "first" and s.hint_path and s.hint_frame >= 0 and self.frame_range()[0] != s.hint_frame:
+            return s.hint_frame
+        return None
 
     def busy(self) -> bool:
         """Has jobs the engine still owns (held, queued or running): the clip can't be removed."""
