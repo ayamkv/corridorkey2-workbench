@@ -22,6 +22,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'hash-file.ps1')
 $ProgressPreference = 'SilentlyContinue'          # Invoke-WebRequest is very slow with its progress bar
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
@@ -101,7 +102,7 @@ function Download([string]$url, [string]$dest, [string]$sha256 = '') {
         Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $part
     }
     if ($sha256) {
-        $got = (Get-FileHash -Algorithm SHA256 $part).Hash.ToLower()
+        $got = Get-WorkbenchSha256 $part
         if ($got -ne $sha256) { Remove-Item $part -Force; Fail "checksum mismatch for $url" }
     }
     Move-Item -Force $part $dest

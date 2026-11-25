@@ -1,7 +1,12 @@
-CorridorKey2 Workbench (studio build)
+CorridorKey2 Workbench 0.0.1 (public preview)
 ====================================
 
 An unofficial desktop app for Corridor Digital's CorridorKey 2.0 green/blue-screen keyer.
+
+This first public preview has been tested on the development machine. A complete clean-machine
+Setup.bat installation has not been validated. See app\docs\RELEASE-0.0.1.md for known limitations.
+This package contains no model weights or inference runtime; setup obtains those separately.
+The app and downloaded engine are free under the Corridor Key Licence 2.0 (app\LICENSE).
 
 
 What you need
@@ -25,7 +30,7 @@ Install
         foundation_stats.safetensors, or a CorridorKey 2.0 folder with weights\ and vfms\.
         Files on the same drive are hard-linked (no extra space); otherwise they are copied.
    If this package has a models folder, it is used automatically.
-4. Wait for "Done" (10 to 30 minutes, mostly downloads), then start it from the
+4. Wait for "Done" (time depends on downloads), then start it from the
    Desktop or Start menu shortcut, or from "CorridorKey2 Workbench.bat" in this folder.
 
 Setup can be run again at any time: it skips what is finished and repairs what is broken.

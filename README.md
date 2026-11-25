@@ -7,6 +7,27 @@ and compare the results in a GPU viewer. The layout is inspired by the official 
 Not affiliated with or endorsed by Corridor Digital, whose own paid app is also called Workbench (see corridorkey.com). The model, weights and `infer.py` are theirs; this
 app runs the **unmodified** upstream code.
 
+## Download 0.0.1 (Windows preview)
+
+Download **CorridorKey2-Workbench-0.0.1.zip** from the
+[v0.0.1 release](https://github.com/ayamkv/corridorkey2-workbench/releases/tag/v0.0.1).
+Extract it to a permanent folder, open **CorridorKey2 Workbench**, and double-click **Setup.bat**.
+Setup installs private Python environments, the upstream engine and ffmpeg; choose to download the
+models or reuse an existing CorridorKey 2.0 folder. This ZIP includes app source and setup scripts,
+with no model weights. You do not need to install Python or Git first.
+
+Requires Windows 10/11 x64, an NVIDIA RTX 30-series GPU or newer with at least 4 GB VRAM,
+about 15 GB free disk space, and internet for setup. Small temporal windows and lower resolutions
+may be necessary on a 4 GB GPU. macOS, Linux and remote/LAN rendering are not supported by this release.
+
+This is the first public preview. Rendering and masking have been exercised on the development
+machine, and automated tests cover engine, project and UI behavior. **A complete clean-machine
+Setup.bat installation has not yet been validated.** Project moving/reopening and mask workflows
+also need broader hands-on testing. See [release notes](docs/RELEASE-0.0.1.md).
+Report problems through [GitHub issues](https://github.com/ayamkv/corridorkey2-workbench/issues),
+including Windows/GPU details and relevant log errors. Remove local paths and any authentication
+tokens before sharing logs.
+
 ## Features
 
 - **Projects.** A project is a folder: `project.json`, `renders\<clip>\render_NNN\` and `masks\<clip>\`.
@@ -67,13 +88,12 @@ D:\CODE\CorridorKey2.0\          upstream clone, unmodified (+ .venv, weights\, 
 D:\CODE\corridorkey2-workbench\  this app (+ its own .venv: no torch)
 ```
 
-## Install for the studio (no Python needed)
+## Build a Windows package
 
 Build a package, send it (or put it on a share), and people run `Setup.bat`:
 
 ```
-powershell -ExecutionPolicy Bypass -File packaging\make_dist.ps1                         # dist\CorridorKey2 Workbench\
-powershell -ExecutionPolicy Bypass -File packaging\make_dist.ps1 -Models <weights> -Zip  # weights inside, plus a .zip
+powershell -ExecutionPolicy Bypass -File packaging\make_dist.ps1 -Release -Zip
 ```
 
 `Setup.bat` (`packaging/setup.ps1`) installs everything into the folder it sits in. It sets up a private Python 3.12
@@ -164,5 +184,7 @@ D:\CODE\CorridorKey2.0\.venv\Scripts\python tests\test_seek_accuracy.py
 
 ## License
 
-CorridorKey is under a modified CC BY-NC-SA 4.0 license. Anything built on it that you release must
-stay free, keep the CorridorKey name and carry the same license. See upstream `LICENSE`.
+This app is available free of charge under the [Corridor Key Licence 2.0](LICENSE),
+which combines CC BY-NC-SA 4.0 with additional terms. The separately downloaded engine and
+weights retain Corridor Digital's licence, including its large-organisation seat requirement.
+See [third-party notices](THIRD_PARTY_NOTICES.md) for fonts, icons, dependencies and models.

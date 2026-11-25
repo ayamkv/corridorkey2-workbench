@@ -7,4 +7,7 @@ Corridor Digital's own paid app is also called Workbench, so "unofficial" stays 
 """
 APP_NAME = "CorridorKey2 Workbench"
 APP_ID = "CorridorKey2Workbench"     # state folder, Windows app id
-__version__ = "0.5.0"
+__version__ = "0.0.1"
+# Preserve the engine contract used by existing integrations. Public app release
+# numbering starts at 0.0.1; private development builds used 0.3.x through 0.5.x.
+ENGINE_API_VERSION = "0.5.0"

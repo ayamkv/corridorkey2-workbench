@@ -364,8 +364,8 @@ def test_add_to_queue_refused_by_an_older_engine(win, clip_path, app):
     win.client.submit = lambda spec, done, hold=False: sent.append((spec, hold))
     win._render(win.clip, hold=True)
     assert sent == [] and "can't hold" in win.st_msg.text()
-    from ckapp import __version__
-    win.client.info["version"] = __version__
+    from ckapp import ENGINE_API_VERSION
+    win.client.info["version"] = ENGINE_API_VERSION
     win._render(win.clip, hold=True)
     spec, hold = sent[0]
     assert hold and spec["project"] == str(win.project.path)

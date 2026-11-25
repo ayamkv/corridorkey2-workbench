@@ -229,7 +229,10 @@ def test_api(clip, tmp_path):
         assert c.get("/health").status_code == 401
         assert c.get("/health", headers={"X-CK-Token": "wrong"}).status_code == 401
         h = {"X-CK-Token": "tok"}
-        assert c.get("/health", headers=h).json()["ok"]
+        from ckapp import ENGINE_API_VERSION, __version__
+        health = c.get("/health", headers=h).json()
+        assert health["ok"] and health["app_version"] == __version__
+        assert health["version"] == ENGINE_API_VERSION
         assert c.post("/jobs", json={"input": "missing.mp4", "output_dir": "o"}, headers=h).status_code == 400
         r = c.post("/jobs", json={"input": clip, "output_dir": str(tmp_path / "out"), "frame_in": 5}, headers=h)
         assert r.status_code == 201

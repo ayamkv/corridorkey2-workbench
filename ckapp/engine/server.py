@@ -18,7 +18,7 @@ from typing import Optional
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from .. import __version__
+from .. import ENGINE_API_VERSION, __version__
 from .jobs import JobQueue, JobSpec
 from .masks import MaskError, MaskService
 
@@ -74,7 +74,7 @@ def gpu_info() -> Optional[dict]:
 
 
 def create_app(queue: JobQueue, bus: EventBus, token: str, masks: Optional[MaskService] = None) -> FastAPI:
-    app = FastAPI(title="CorridorKey2 Workbench engine", version=__version__)
+    app = FastAPI(title="CorridorKey2 Workbench engine", version=ENGINE_API_VERSION)
 
     def auth(request: Request) -> None:
         got = request.headers.get("x-ck-token") or request.query_params.get("token") or ""
@@ -83,7 +83,8 @@ def create_app(queue: JobQueue, bus: EventBus, token: str, masks: Optional[MaskS
 
     @app.get("/health", dependencies=[Depends(auth)])
     def health() -> dict:
-        return {"ok": True, "version": __version__, "pid": os.getpid(), "busy": queue.busy(),
+        return {"ok": True, "version": ENGINE_API_VERSION, "app_version": __version__,
+                "pid": os.getpid(), "busy": queue.busy(),
                 "ck_root": queue.ck_root, "ck_python": queue.ck_python}
 
     @app.get("/system", dependencies=[Depends(auth)])

@@ -4,6 +4,16 @@ CorridorKey2 Workbench: an unofficial native desktop app for
 [CorridorKey 2.0](https://github.com/nikopueringer/CorridorKey2.0).
 Check items off as they land. Decisions and the reasons for them live in `PLAN.md`.
 
+## First public release — 2026-11-25
+
+Public version **0.0.1** contains the project, viewer, queue and masking features from private
+development versions 0.3.x–0.5.x. Windows preview package, setup guidance, licences and known
+limitations are in [docs/RELEASE-0.0.1.md](docs/RELEASE-0.0.1.md). The engine API keeps version
+0.5.0 for compatibility. LAN hosting remains planned. The complete clean-machine installer and
+broader hands-on project/mask validation remain pending.
+
+The development notes below record the earlier state and validation history.
+
 ## Where we left off (2026-11-06)
 
 Read this first when picking the work back up.

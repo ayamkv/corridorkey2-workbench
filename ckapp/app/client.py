@@ -52,10 +52,10 @@ def start_engine(wait_s: float = 20.0) -> dict:
     """Return a healthy engine's discovery info, starting a detached engine if needed.
     An idle engine left running by another app version is replaced, since it may not know newer job
     settings; a busy one is kept so its renders finish."""
-    from .. import __version__
+    from .. import ENGINE_API_VERSION, __version__
     info = _discovery()
     h = _health(info) if info else None
-    if h and (h.get("version") == __version__ or h.get("busy")):
+    if h and (h.get("app_version", h.get("version")) == __version__ or h.get("busy")):
         return dict(info, version=h.get("version", ""))
     if h and h.get("pid"):
         _stop_engine(int(h["pid"]))
@@ -77,8 +77,10 @@ def start_engine(wait_s: float = 20.0) -> dict:
     while time.time() < end:
         time.sleep(0.25)
         info = _discovery()
-        if info and _healthy(info, timeout=1.0):
-            return dict(info, version=__version__)
+        if info:
+            health = _health(info, timeout=1.0)
+            if health:
+                return dict(info, version=health.get("version", ENGINE_API_VERSION))
     raise RuntimeError(f"the render engine did not start; see {state_dir() / 'engine.log'}")
 
 
